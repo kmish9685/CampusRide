@@ -9,9 +9,9 @@ import Admin from "./pages/Admin";
 export default function App() {
   return (
     <BrowserRouter>
-      <div className="min-h-screen flex flex-col bg-gray-950 text-gray-100">
+      <div className="min-h-screen flex flex-col bg-gray-950 text-gray-100 overflow-x-hidden">
         <Navbar />
-        <main className="flex-1 flex flex-col">
+        <main className="flex-1 flex flex-col overflow-x-hidden">
           <Routes>
             <Route path="/" element={<Home />} />
             <Route path="/student" element={<Student />} />
