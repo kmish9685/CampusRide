@@ -5,32 +5,67 @@ import {
   upsertBus,
   type CrowdLevel,
   type BusRow,
+  type BusStatus,
+  type CrowdSource,
   type StopWait,
   fetchActiveWaits,
+  computeAutoCrowd,
+  clearWaitsForStop,
+  demoChannel,
 } from "../lib/supabase";
-import { BUS_ID, ROUTE_POLYLINE, STOPS } from "../data/route";
+import { BUS_ID, STOPS } from "../data/route";
 import { lerpOnRoute } from "../lib/routeUtils";
 
 export default function Driver() {
   const [isTripActive, setIsTripActive] = useState<boolean>(false);
-  const [isSimulateMode, setIsSimulateMode] = useState<boolean>(false);
+  const [isSimulateMode, setIsSimulateMode] = useState<boolean>(true); // default to simulate mode for smooth hackathon demo
   const [crowdLevel, setCrowdLevel] = useState<CrowdLevel>("seats");
+  const [crowdSource, setCrowdSource] = useState<CrowdSource>("auto");
+  const [occupancy, setOccupancy] = useState<number>(18);
+  const [busStatus, setBusStatus] = useState<BusStatus>("on_time");
   const [saveFeedback, setSaveFeedback] = useState<string | null>(null);
   const [isConnected, setIsConnected] = useState<boolean>(false);
   const [activeWaits, setActiveWaits] = useState<StopWait[]>([]);
-  const [gpsLocation, setGpsLocation] = useState<{
-    lat: number;
-    lng: number;
-    accuracy?: number;
-  } | null>(null);
   const [lastSentTime, setLastSentTime] = useState<Date | null>(null);
-  const [pingsSent, setPingsSent] = useState<number>(0);
+  const [updatesSent, setUpdatesSent] = useState<number>(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  // References for tracking GPS & Simulation intervals
+  // Network loss simulation & offline queue
+  const [isSimulatingNetworkLoss, setIsSimulatingNetworkLoss] = useState<boolean>(false);
+  const [networkLossSecondsLeft, setNetworkLossSecondsLeft] = useState<number>(0);
+  const [offlineQueue, setOfflineQueue] = useState<any[]>(() => {
+    try {
+      const q = localStorage.getItem("campusride_driver_queue");
+      return q ? JSON.parse(q) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  // First-time visitor hint
+  const [showHint, setShowHint] = useState<boolean>(() => {
+    return !localStorage.getItem("campusride_driver_hint_dismissed");
+  });
+
   const watchIdRef = useRef<number | null>(null);
   const simIntervalRef = useRef<number | null>(null);
   const simProgressRef = useRef<number>(0);
+  const lastPassedStopIdxRef = useRef<number>(-1);
+  const offlineQueueRef = useRef(offlineQueue);
+  offlineQueueRef.current = offlineQueue;
+  // Speed multiplier for demo mode (controlled by Admin Demo Controls)
+  const demoSpeedRef = useRef<number>(
+    localStorage.getItem("campusride_demo_speed_x3") === "1" ? 3 : 1
+  );
+
+  // Persist offline queue
+  useEffect(() => {
+    try {
+      localStorage.setItem("campusride_driver_queue", JSON.stringify(offlineQueue));
+    } catch (e) {
+      console.warn("localStorage error:", e);
+    }
+  }, [offlineQueue]);
 
   // Fetch active student waits
   const reloadWaits = async () => {
@@ -44,7 +79,57 @@ export default function Driver() {
     }
   };
 
-  // Supabase Realtime channel status & initial fetch
+  // Flush offline queue when network is available
+  const flushQueue = async () => {
+    if (offlineQueueRef.current.length === 0 || isSimulatingNetworkLoss || !isSupabaseConfigured) return;
+    const items = [...offlineQueueRef.current];
+    setOfflineQueue([]);
+    for (const item of items) {
+      try {
+        await upsertBus(item);
+      } catch (err) {
+        console.warn("Queue replay error:", err);
+      }
+    }
+    setSaveFeedback("Synced queued updates");
+    setTimeout(() => setSaveFeedback(null), 2500);
+  };
+
+  // Demo broadcast event listener (from Admin Demo Controls)
+  useEffect(() => {
+    const handleDemoEvent = (event: string, payload: Record<string, unknown>) => {
+      if (event === "demo_reset") {
+        // Reset simulate trip progress back to start
+        simProgressRef.current = 0;
+        lastPassedStopIdxRef.current = -1;
+        setOccupancy(0);
+        setCrowdLevel("seats");
+        setCrowdSource("auto");
+        setBusStatus("on_time");
+      } else if (event === "demo_speed") {
+        demoSpeedRef.current = (payload.x3 as boolean) ? 3 : 1;
+      }
+    };
+
+    if (demoChannel) {
+      demoChannel.on("broadcast", { event: "demo_reset" }, ({ payload }) => handleDemoEvent("demo_reset", payload || {}));
+      demoChannel.on("broadcast", { event: "demo_speed" }, ({ payload }) => handleDemoEvent("demo_speed", payload || {}));
+    }
+
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== "campusride_demo_event" || !e.newValue) return;
+      try {
+        const { event, payload } = JSON.parse(e.newValue);
+        handleDemoEvent(event, payload || {});
+      } catch {}
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+
+  // Realtime subscription & initial fetch
   useEffect(() => {
     if (!isSupabaseConfigured || !supabase) {
       setIsConnected(false);
@@ -54,27 +139,24 @@ export default function Driver() {
     const channel = supabase
       .channel("driver-status-channel")
       .subscribe((status) => {
-        console.log("[CampusRide Driver Realtime Channel Status]:", status);
+        console.log("[CampusRide Driver Realtime Status]:", status);
         setIsConnected(status === "SUBSCRIBED");
+        if (status === "SUBSCRIBED") {
+          flushQueue();
+        }
       });
 
-    // Realtime channel for live student waits
     const waitsChannel = supabase
       .channel("driver-waits-channel")
       .on(
         "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "stop_waits",
-        },
+        { event: "*", schema: "public", table: "stop_waits" },
         () => {
           reloadWaits();
         }
       )
       .subscribe();
 
-    // Fetch initial state
     supabase
       .from("buses")
       .select("*")
@@ -84,9 +166,9 @@ export default function Driver() {
         if (data) {
           const row = data as BusRow;
           setCrowdLevel(row.crowd_level || "seats");
-          if (row.lat && row.lng) {
-            setGpsLocation({ lat: row.lat, lng: row.lng });
-          }
+          if (row.occupancy !== undefined) setOccupancy(row.occupancy);
+          if (row.status) setBusStatus(row.status);
+          if (row.crowd_source) setCrowdSource(row.crowd_source);
         }
       });
 
@@ -98,51 +180,118 @@ export default function Driver() {
     };
   }, []);
 
-  // Update Crowd Level Immediately via upsertBus
-  const handleSetCrowd = async (level: CrowdLevel) => {
-    setCrowdLevel(level);
-    setSaveFeedback("Saving...");
+  // Timer for network loss simulation (30s)
+  useEffect(() => {
+    if (!isSimulatingNetworkLoss) return;
+    setNetworkLossSecondsLeft(30);
+
+    const interval = setInterval(() => {
+      setNetworkLossSecondsLeft((prev) => {
+        if (prev <= 1) {
+          clearInterval(interval);
+          setIsSimulatingNetworkLoss(false);
+          flushQueue();
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [isSimulatingNetworkLoss]);
+
+  // Update Bus Operational Status (On Time / Delayed / Breakdown)
+  const handleSetStatus = async (status: BusStatus) => {
+    setBusStatus(status);
+    setSaveFeedback("Status updating...");
+
+    const payload = { id: BUS_ID, status };
+
+    if (isSimulatingNetworkLoss || !isSupabaseConfigured) {
+      setOfflineQueue((prev) => [...prev, payload]);
+      setSaveFeedback("Queued offline");
+      setTimeout(() => setSaveFeedback(null), 2000);
+      return;
+    }
 
     try {
-      const { error } = await upsertBus({
-        id: BUS_ID,
-        crowd_level: level,
-      });
-
+      const { error } = await upsertBus(payload);
       if (!error) {
         setSaveFeedback("Saved!");
         setTimeout(() => setSaveFeedback(null), 2000);
-      } else {
-        console.error("Failed to update crowd level:", error);
-        setSaveFeedback("Save failed!");
-        setTimeout(() => setSaveFeedback(null), 3000);
       }
-    } catch (err) {
-      console.error("Supabase crowd update error:", err);
-      setSaveFeedback("Save error!");
-      setTimeout(() => setSaveFeedback(null), 3000);
+    } catch {
+      setOfflineQueue((prev) => [...prev, payload]);
+      setSaveFeedback("Queued offline");
+      setTimeout(() => setSaveFeedback(null), 2000);
     }
   };
 
-  // Helper to push location
-  const pushLocation = async (lat: number, lng: number, accuracy?: number) => {
-    setGpsLocation({ lat, lng, accuracy });
-    try {
-      const { error } = await upsertBus({
-        id: BUS_ID,
-        lat,
-        lng,
-        is_active: true,
-      });
+  // Manual Override Crowd Level
+  const handleSetCrowdManual = async (level: CrowdLevel) => {
+    setCrowdLevel(level);
+    setCrowdSource("manual");
+    setSaveFeedback("Manual override saving...");
 
+    const payload = {
+      id: BUS_ID,
+      crowd_level: level,
+      crowd_source: "manual" as CrowdSource,
+    };
+
+    if (isSimulatingNetworkLoss || !isSupabaseConfigured) {
+      setOfflineQueue((prev) => [...prev, payload]);
+      setSaveFeedback("Queued offline");
+      setTimeout(() => setSaveFeedback(null), 2000);
+      return;
+    }
+
+    try {
+      const { error } = await upsertBus(payload);
+      if (!error) {
+        setSaveFeedback("Saved!");
+        setTimeout(() => setSaveFeedback(null), 2000);
+      }
+    } catch {
+      setOfflineQueue((prev) => [...prev, payload]);
+      setSaveFeedback("Queued offline");
+      setTimeout(() => setSaveFeedback(null), 2000);
+    }
+  };
+
+  // Push Location & Occupancy
+  const broadcastUpdate = async (lat: number, lng: number, occ: number, crowd: CrowdLevel) => {
+    const payload = {
+      id: BUS_ID,
+      lat,
+      lng,
+      occupancy: occ,
+      crowd_level: crowd,
+      status: busStatus,
+      crowd_source: crowdSource,
+      is_active: true,
+    };
+
+    if (isSimulatingNetworkLoss || !isSupabaseConfigured) {
+      setOfflineQueue((prev) => [...prev, payload]);
+      setLastSentTime(new Date());
+      setUpdatesSent((prev) => prev + 1);
+      return;
+    }
+
+    try {
+      const { error } = await upsertBus(payload);
       if (!error) {
         setLastSentTime(new Date());
-        setPingsSent((prev) => prev + 1);
+        setUpdatesSent((prev) => prev + 1);
+        if (offlineQueueRef.current.length > 0) {
+          flushQueue();
+        }
       } else {
-        console.warn("Location push error:", error.message);
+        setOfflineQueue((prev) => [...prev, payload]);
       }
-    } catch (err) {
-      console.error("Failed to broadcast location:", err);
+    } catch {
+      setOfflineQueue((prev) => [...prev, payload]);
     }
   };
 
@@ -151,71 +300,94 @@ export default function Driver() {
     setErrorMessage(null);
     setIsTripActive(true);
 
-    // If Simulate Trip Mode is active
     if (isSimulateMode) {
       const initialPos = lerpOnRoute(simProgressRef.current);
-      pushLocation(initialPos.lat, initialPos.lng, 5);
+      broadcastUpdate(initialPos.lat, initialPos.lng, occupancy, crowdLevel);
 
       if (simIntervalRef.current) clearInterval(simIntervalRef.current);
+
       simIntervalRef.current = window.setInterval(() => {
-        simProgressRef.current = (simProgressRef.current + 3 / 120) % 1;
-        const nextPos = lerpOnRoute(simProgressRef.current);
-        pushLocation(nextPos.lat, nextPos.lng, 5);
+        const speedMult = demoSpeedRef.current;
+        // Advance by speedMult × base step (3s per tick at normal speed)
+        const newProgress = (simProgressRef.current + (speedMult * 3) / 120) % 1;
+        simProgressRef.current = newProgress;
+        const nextPos = lerpOnRoute(newProgress);
+
+        // Check if passing any of the 5 stops
+        // 5 stops roughly at progress [0, 0.22, 0.48, 0.74, 0.98]
+        const stopProgresses = [0, 0.22, 0.48, 0.74, 0.98];
+        let currentOcc = occupancy;
+        let currentCrowd = crowdLevel;
+
+        for (let i = 0; i < stopProgresses.length; i++) {
+          const sp = stopProgresses[i];
+          if (
+            Math.abs(newProgress - sp) < 0.03 &&
+            lastPassedStopIdxRef.current !== i
+          ) {
+            lastPassedStopIdxRef.current = i;
+            const stop = STOPS[i];
+
+            if (i === 4) {
+              // Last stop: College Main Gate -> occupancy resets to 0
+              currentOcc = 0;
+            } else {
+              // Add waiting students to occupancy
+              const waitingCount = activeWaits.filter((w) => w.stop_name === stop.name).length;
+              currentOcc = Math.min(50, currentOcc + waitingCount);
+              clearWaitsForStop(stop.name, BUS_ID);
+              reloadWaits();
+            }
+
+            setOccupancy(currentOcc);
+
+            // Recompute auto crowd if driver hasn't locked manual override
+            if (crowdSource === "auto") {
+              currentCrowd = computeAutoCrowd(currentOcc, 50);
+              setCrowdLevel(currentCrowd);
+            }
+            break;
+          }
+        }
+
+        broadcastUpdate(nextPos.lat, nextPos.lng, currentOcc, currentCrowd);
       }, 3000);
       return;
     }
 
     // Real GPS Mode
-    const isSecure = window.isSecureContext;
-    if (!isSecure && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1") {
-      setErrorMessage("Real GPS needs HTTPS. Use Simulate Trip, or open the deployed Vercel link.");
-      setIsTripActive(false);
-      return;
-    }
-
     if (!navigator.geolocation) {
-      setErrorMessage("Geolocation is not supported by your browser. Use Simulate Trip instead.");
+      setErrorMessage("GPS not supported. Use Simulate Trip instead.");
       setIsTripActive(false);
       return;
     }
 
     watchIdRef.current = navigator.geolocation.watchPosition(
       (pos) => {
-        pushLocation(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy);
-        setErrorMessage(null);
+        broadcastUpdate(pos.coords.latitude, pos.coords.longitude, occupancy, crowdLevel);
       },
-      (err) => {
-        if (err.code === err.PERMISSION_DENIED) {
-          setErrorMessage("GPS permission was denied. Use Simulate Trip to demo without GPS.");
-        } else {
-          setErrorMessage("GPS signal weak or unavailable. Switch to Simulate Trip.");
-        }
+      () => {
+        setErrorMessage("GPS signal weak. Switch to Simulate Trip for demo.");
       },
-      { enableHighAccuracy: true, maximumAge: 3000, timeout: 10000 }
+      { enableHighAccuracy: true, timeout: 10000 }
     );
   };
 
   // End Trip
   const handleEndTrip = () => {
     setIsTripActive(false);
-
     if (watchIdRef.current !== null) {
       navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = null;
     }
-
     if (simIntervalRef.current !== null) {
       clearInterval(simIntervalRef.current);
       simIntervalRef.current = null;
     }
-
-    upsertBus({
-      id: BUS_ID,
-      is_active: false,
-    });
+    upsertBus({ id: BUS_ID, is_active: false });
   };
 
-  // Clean up watchers on unmount
+  // Clean up
   useEffect(() => {
     return () => {
       if (watchIdRef.current !== null) navigator.geolocation.clearWatch(watchIdRef.current);
@@ -227,34 +399,78 @@ export default function Driver() {
 
   return (
     <div className="flex-1 flex flex-col items-center p-4 sm:p-6 max-w-lg mx-auto w-full space-y-4">
-      {/* Realtime Connection Status & DB notice */}
+      {/* Dismissable First-Time Hint */}
+      {showHint && (
+        <div className="w-full bg-indigo-950/80 border border-indigo-800/80 rounded-2xl p-3 text-xs text-indigo-200 flex items-center justify-between shadow-sm">
+          <span>Tap <strong>Start Trip</strong> or <strong>Simulate Trip</strong> to broadcast your location.</span>
+          <button
+            type="button"
+            onClick={() => {
+              setShowHint(false);
+              localStorage.setItem("campusride_driver_hint_dismissed", "1");
+            }}
+            className="text-indigo-400 hover:text-white ml-2 font-bold px-1.5 py-0.5 rounded"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* Connection & Offline Queue Status Bar */}
       <div className="w-full flex items-center justify-between bg-gray-900/90 border border-gray-800 rounded-2xl px-4 py-2.5 shadow-sm text-xs">
         <div className="flex items-center gap-2">
           <span
             className={`w-2.5 h-2.5 rounded-full ${
-              isConnected ? "bg-emerald-400 animate-pulse" : "bg-gray-500"
+              isSimulatingNetworkLoss
+                ? "bg-amber-400 animate-pulse"
+                : isConnected
+                ? "bg-emerald-400 animate-pulse"
+                : "bg-gray-500"
             }`}
           />
           <span className="font-semibold text-gray-300">
-            {isConnected ? "Connected (Realtime)" : "Offline / Connecting"}
+            {isSimulatingNetworkLoss
+              ? `Simulating Network Loss (${networkLossSecondsLeft}s left)`
+              : isConnected
+              ? "Connected"
+              : "Offline"}
           </span>
         </div>
-        <span className="text-gray-400 font-mono text-[11px]">{BUS_ID}</span>
+
+        {offlineQueue.length > 0 ? (
+          <span className="text-amber-400 font-bold bg-amber-950/80 border border-amber-800/60 px-2 py-0.5 rounded-full text-[11px]">
+            {offlineQueue.length} queued
+          </span>
+        ) : (
+          <span className="text-emerald-400 font-medium text-[11px]">Synced</span>
+        )}
       </div>
 
-      {!isSupabaseConfigured && (
-        <div className="w-full bg-amber-950/80 border border-amber-800/80 rounded-2xl p-3.5 text-xs text-amber-300 flex items-start gap-2.5">
-          <svg className="w-4 h-4 shrink-0 text-amber-400 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-          </svg>
-          <div>
-            <p className="font-semibold text-amber-200">Database not configured</p>
-            <p className="text-amber-400/90 mt-0.5">
-              Add Supabase keys in <code className="bg-amber-900/60 px-1 py-0.5 rounded text-[11px]">.env</code> to sync live data across devices.
-            </p>
-          </div>
+      {/* Network Loss Simulation Button for Jury Demo */}
+      <div className="w-full bg-gray-900/90 border border-gray-800 rounded-2xl p-3 flex items-center justify-between shadow-sm">
+        <div>
+          <span className="text-xs font-semibold text-white block">Network Drop Simulation</span>
+          <span className="text-[11px] text-gray-400">Pause sending for 30s to demonstrate offline queueing</span>
         </div>
-      )}
+        <button
+          type="button"
+          onClick={() => {
+            if (isSimulatingNetworkLoss) {
+              setIsSimulatingNetworkLoss(false);
+              flushQueue();
+            } else {
+              setIsSimulatingNetworkLoss(true);
+            }
+          }}
+          className={`px-3 py-1.5 rounded-xl font-bold text-xs transition-all ${
+            isSimulatingNetworkLoss
+              ? "bg-amber-600 text-white shadow-lg shadow-amber-950/50"
+              : "bg-gray-800 text-gray-300 hover:bg-gray-700"
+          }`}
+        >
+          {isSimulatingNetworkLoss ? "Reconnect Now" : "Simulate Network Loss"}
+        </button>
+      </div>
 
       {/* GPS Error / Warning Banner */}
       {errorMessage && (
@@ -302,11 +518,11 @@ export default function Driver() {
               : "text-gray-400 hover:text-gray-200"
           } ${isTripActive ? "opacity-60 cursor-not-allowed" : ""}`}
         >
-          Simulate Trip (No GPS needed)
+          Simulate Trip (Demo Mode)
         </button>
       </div>
 
-      {/* Trip Status Header Card */}
+      {/* Vehicle Status & Active Duty Header */}
       <div className="w-full bg-gray-900/90 border border-gray-800 rounded-2xl p-4 sm:p-5 shadow-lg flex items-center justify-between">
         <div>
           <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
@@ -334,7 +550,7 @@ export default function Driver() {
         </div>
       </div>
 
-      {/* Trip Control: Start / End Trip (Big Buttons for Driver in Phone Mount) */}
+      {/* Trip Control: Start / End Trip (Big Buttons) */}
       <div className="w-full grid grid-cols-2 gap-3">
         <button
           type="button"
@@ -348,7 +564,7 @@ export default function Driver() {
         >
           <span>Start Trip</span>
           <span className="text-[11px] font-normal opacity-80">
-            {isSimulateMode ? "Broadcast Simulated Path" : "Broadcast Real GPS"}
+            {isSimulateMode ? "Broadcast Road Path" : "Broadcast GPS"}
           </span>
         </button>
 
@@ -367,65 +583,110 @@ export default function Driver() {
         </button>
       </div>
 
-      {/* Crowd Level Selector (Three Large Buttons, Immediate Upsert) */}
+      {/* Bus Status Buttons: On Time / Delayed / Breakdown */}
+      <div className="w-full bg-gray-900/90 border border-gray-800 rounded-2xl p-4 sm:p-5 shadow-lg space-y-2.5">
+        <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider block">
+          Bus Status
+        </span>
+        <div className="grid grid-cols-3 gap-2">
+          <button
+            type="button"
+            onClick={() => handleSetStatus("on_time")}
+            className={`h-11 rounded-xl font-bold text-xs sm:text-sm border transition-all ${
+              busStatus === "on_time"
+                ? "bg-emerald-600 text-white border-emerald-400 ring-2 ring-emerald-400/40"
+                : "bg-gray-800 text-gray-300 border-gray-700 hover:bg-gray-750"
+            }`}
+          >
+            On time
+          </button>
+          <button
+            type="button"
+            onClick={() => handleSetStatus("delayed")}
+            className={`h-11 rounded-xl font-bold text-xs sm:text-sm border transition-all ${
+              busStatus === "delayed"
+                ? "bg-amber-600 text-white border-amber-400 ring-2 ring-amber-400/40"
+                : "bg-gray-800 text-gray-300 border-gray-700 hover:bg-gray-750"
+            }`}
+          >
+            Delayed
+          </button>
+          <button
+            type="button"
+            onClick={() => handleSetStatus("breakdown")}
+            className={`h-11 rounded-xl font-bold text-xs sm:text-sm border transition-all ${
+              busStatus === "breakdown"
+                ? "bg-rose-600 text-white border-rose-400 ring-2 ring-rose-400/40"
+                : "bg-gray-800 text-gray-300 border-gray-700 hover:bg-gray-750"
+            }`}
+          >
+            Breakdown
+          </button>
+        </div>
+      </div>
+
+      {/* Crowd Level & Occupancy Card */}
       <div className="w-full bg-gray-900/90 border border-gray-800 rounded-2xl p-4 sm:p-5 shadow-lg space-y-3">
         <div className="flex items-center justify-between">
-          <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
-            Current Bus Crowd Level
-          </span>
+          <div>
+            <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider block">
+              Crowd Status ({crowdSource === "auto" ? "Auto" : "Set by driver"})
+            </span>
+            <p className="text-sm font-bold text-white mt-0.5">
+              Estimated {occupancy}/50 on board
+            </p>
+          </div>
           {saveFeedback && (
-            <span
-              className={`text-xs font-semibold ${
-                saveFeedback === "Saved!" ? "text-emerald-400" : "text-indigo-400"
-              }`}
-            >
+            <span className="text-xs font-semibold text-emerald-400 bg-emerald-950/80 px-2 py-0.5 rounded-full border border-emerald-800/60">
               {saveFeedback}
             </span>
           )}
         </div>
 
-        <div className="grid grid-cols-3 gap-2.5">
-          {/* Seats Available (Green) */}
-          <button
-            type="button"
-            onClick={() => handleSetCrowd("seats")}
-            className={`min-h-[58px] p-2 rounded-xl flex flex-col items-center justify-center text-center font-bold text-xs sm:text-sm transition-all border ${
-              crowdLevel === "seats"
-                ? "bg-emerald-600 text-white border-emerald-400 shadow-lg shadow-emerald-950/60 ring-2 ring-emerald-400/40"
-                : "bg-gray-800/80 text-emerald-300/80 border-gray-700/60 hover:bg-gray-800"
-            }`}
-          >
-            <span>Seats</span>
-            <span className="text-[10px] font-normal opacity-90">Available</span>
-          </button>
+        <div className="space-y-1.5">
+          <span className="text-[11px] text-gray-400 font-medium block">
+            Override crowd level:
+          </span>
+          <div className="grid grid-cols-3 gap-2">
+            <button
+              type="button"
+              onClick={() => handleSetCrowdManual("seats")}
+              className={`min-h-[50px] p-2 rounded-xl flex flex-col items-center justify-center font-bold text-xs transition-all border ${
+                crowdLevel === "seats"
+                  ? "bg-emerald-600 text-white border-emerald-400 shadow-md ring-2 ring-emerald-400/40"
+                  : "bg-gray-800 text-emerald-300/80 border-gray-700 hover:bg-gray-750"
+              }`}
+            >
+              <span>Seats</span>
+              <span className="text-[10px] font-normal opacity-90">Available</span>
+            </button>
 
-          {/* Standing Only (Yellow) */}
-          <button
-            type="button"
-            onClick={() => handleSetCrowd("standing")}
-            className={`min-h-[58px] p-2 rounded-xl flex flex-col items-center justify-center text-center font-bold text-xs sm:text-sm transition-all border ${
-              crowdLevel === "standing"
-                ? "bg-amber-600 text-white border-amber-400 shadow-lg shadow-amber-950/60 ring-2 ring-amber-400/40"
-                : "bg-gray-800/80 text-amber-300/80 border-gray-700/60 hover:bg-gray-800"
-            }`}
-          >
-            <span>Standing</span>
-            <span className="text-[10px] font-normal opacity-90">Only</span>
-          </button>
+            <button
+              type="button"
+              onClick={() => handleSetCrowdManual("standing")}
+              className={`min-h-[50px] p-2 rounded-xl flex flex-col items-center justify-center font-bold text-xs transition-all border ${
+                crowdLevel === "standing"
+                  ? "bg-amber-600 text-white border-amber-400 shadow-md ring-2 ring-amber-400/40"
+                  : "bg-gray-800 text-amber-300/80 border-gray-700 hover:bg-gray-750"
+              }`}
+            >
+              <span>Standing</span>
+              <span className="text-[10px] font-normal opacity-90">Only</span>
+            </button>
 
-          {/* Full (Red) */}
-          <button
-            type="button"
-            onClick={() => handleSetCrowd("full")}
-            className={`min-h-[58px] p-2 rounded-xl flex flex-col items-center justify-center text-center font-bold text-xs sm:text-sm transition-all border ${
-              crowdLevel === "full"
-                ? "bg-rose-600 text-white border-rose-400 shadow-lg shadow-rose-950/60 ring-2 ring-rose-400/40"
-                : "bg-gray-800/80 text-rose-300/80 border-gray-700/60 hover:bg-gray-800"
-            }`}
-          >
-            <span>Bus Full</span>
-            <span className="text-[10px] font-normal opacity-90">No Entry</span>
-          </button>
+            <button
+              type="button"
+              onClick={() => handleSetCrowdManual("full")}
+              className={`min-h-[50px] p-2 rounded-xl flex flex-col items-center justify-center font-bold text-xs transition-all border ${
+                crowdLevel === "full"
+                  ? "bg-rose-600 text-white border-rose-400 shadow-md ring-2 ring-rose-400/40"
+                  : "bg-gray-800 text-rose-300/80 border-gray-700 hover:bg-gray-750"
+              }`}
+            >
+              <span>Full</span>
+              <span className="text-[10px] font-normal opacity-90">Bus full</span>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -471,44 +732,24 @@ export default function Driver() {
         </div>
       </div>
 
-      {/* Live Telemetry / GPS Details Screen */}
+      {/* Broadcast Telemetry (Clean words: Location updates & Last update) */}
       <div className="w-full bg-gray-900/90 border border-gray-800 rounded-2xl p-4 sm:p-5 shadow-lg space-y-3">
         <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
-          Broadcast Telemetry ({isSimulateMode ? "Every 3s" : "Every 5s"})
+          Location Updates
         </span>
 
         <div className="grid grid-cols-2 gap-3 text-xs">
           <div className="bg-gray-950/60 border border-gray-800 rounded-xl p-3">
-            <span className="text-gray-400 text-[11px] block">Latitude / Longitude</span>
-            <p className="font-mono font-bold text-gray-200 mt-1 truncate">
-              {gpsLocation
-                ? `${gpsLocation.lat.toFixed(5)}, ${gpsLocation.lng.toFixed(5)}`
-                : "Awaiting Start..."}
-            </p>
-          </div>
-
-          <div className="bg-gray-950/60 border border-gray-800 rounded-xl p-3">
-            <span className="text-gray-400 text-[11px] block">Accuracy</span>
+            <span className="text-gray-400 text-[11px] block">Last update</span>
             <p className="font-mono font-bold text-gray-200 mt-1">
-              {gpsLocation?.accuracy
-                ? `±${Math.round(gpsLocation.accuracy)} m`
-                : isTripActive
-                ? "Simulated"
-                : "Idle"}
+              {lastSentTime ? lastSentTime.toLocaleTimeString() : "Awaiting start"}
             </p>
           </div>
 
           <div className="bg-gray-950/60 border border-gray-800 rounded-xl p-3">
-            <span className="text-gray-400 text-[11px] block">Last Sent</span>
-            <p className="font-mono font-bold text-gray-200 mt-1">
-              {lastSentTime ? lastSentTime.toLocaleTimeString() : "None"}
-            </p>
-          </div>
-
-          <div className="bg-gray-950/60 border border-gray-800 rounded-xl p-3">
-            <span className="text-gray-400 text-[11px] block">Pings Broadcast</span>
+            <span className="text-gray-400 text-[11px] block">Updates sent</span>
             <p className="font-mono font-bold text-indigo-400 mt-1">
-              {pingsSent} {pingsSent === 1 ? "ping" : "pings"}
+              {updatesSent} {updatesSent === 1 ? "update" : "updates"}
             </p>
           </div>
         </div>

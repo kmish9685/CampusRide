@@ -8,10 +8,14 @@ import {
   isSupabaseConfigured,
   type CrowdLevel,
   type BusRow,
+  type BusStatus,
+  type CrowdSource,
   type StopWait,
   fetchActiveWaits,
   markStopWait,
   cancelStopWait,
+  computeAutoCrowd,
+  demoChannel,
 } from "../lib/supabase";
 
 // Modern SVG-based DivIcons for stops
@@ -42,7 +46,8 @@ const createStopIcon = (index: number, isSelected: boolean) => {
 };
 
 // Modern SVG-based DivIcon for the bus with heading rotation & pulsing halo
-const createBusIcon = (bearing = 0) => {
+const createBusIcon = (bearing = 0, isBus2 = false, isFaded = false) => {
+  const bg = isBus2 ? "#7c3aed" : "#4f46e5";
   return L.divIcon({
     className: "custom-bus-marker",
     html: `
@@ -52,12 +57,13 @@ const createBusIcon = (bearing = 0) => {
         justify-content: center;
         width: 38px;
         height: 38px;
-        background: #4f46e5;
+        background: ${bg};
         border: 2.5px solid #ffffff;
         border-radius: 9999px;
         box-shadow: 0 8px 16px rgba(79, 70, 229, 0.6);
         transform: rotate(${Math.round(bearing)}deg);
         transition: transform 0.35s ease-out;
+        opacity: ${isFaded ? "0.6" : "1"};
       ">
         <svg style="width: 18px; height: 18px; fill: #ffffff;" viewBox="0 0 24 24">
           <path d="M12 2L4.5 20.29l.71.71L12 18l6.79 3 .71-.71z" />
@@ -140,9 +146,18 @@ function RecenterButton({ busPosition }: { busPosition: RoutePoint }) {
 
 export default function Student() {
   const [isDemoMode, setIsDemoMode] = useState<boolean>(true);
-  const [selectedStopId, setSelectedStopId] = useState<string>(STOPS[4].id); // default: College Main Gate
+
+  // Remember selected stop in localStorage
+  const [selectedStopId, setSelectedStopId] = useState<string>(() => {
+    return localStorage.getItem("campusride_selected_stop") || STOPS[4].id;
+  });
+
   const [busPosition, setBusPosition] = useState<RoutePoint>(ROUTE_POLYLINE[0]);
+  const [bus2Position, setBus2Position] = useState<RoutePoint>(ROUTE_POLYLINE[0]);
   const [crowdLevel, setCrowdLevel] = useState<CrowdLevel>("seats");
+  const [crowdSource, setCrowdSource] = useState<CrowdSource>("auto");
+  const [occupancy, setOccupancy] = useState<number>(24);
+  const [busStatus, setBusStatus] = useState<BusStatus>("on_time");
   const [lastUpdatedAt, setLastUpdatedAt] = useState<number>(Date.now());
   const [secondsAgo, setSecondsAgo] = useState<number>(0);
   const [isConnected, setIsConnected] = useState<boolean>(false);
@@ -153,10 +168,29 @@ export default function Student() {
   const [activeWaits, setActiveWaits] = useState<StopWait[]>([]);
   const [isUserWaiting, setIsUserWaiting] = useState<boolean>(false);
 
+  // Dismissable first-time hint
+  const [showHint, setShowHint] = useState<boolean>(() => {
+    return !localStorage.getItem("campusride_student_hint_dismissed");
+  });
+
   const tileErrorsRef = useRef<number>(0);
   const demoProgressRef = useRef<number>(0);
+  const bus2ProgressRef = useRef<number>(0.88); // BUS-02 runs ~10-12 mins behind BUS-01
   const animationFrameRef = useRef<number | null>(null);
   const lastTickRef = useRef<number>(Date.now());
+  // Speed multiplier: default 1, or 3 when demo_speed x3 is active
+  const demoSpeedRef = useRef<number>(
+    localStorage.getItem("campusride_demo_speed_x3") === "1" ? 3 : 1
+  );
+  // Network-loss simulation state (triggered from Admin Demo Controls)
+  const [isDemoNetworkLoss, setIsDemoNetworkLoss] = useState<boolean>(false);
+  const demoNetworkLossTimerRef = useRef<number | null>(null);
+
+  // Save selected stop to localStorage
+  const handleSelectStop = (stopId: string) => {
+    setSelectedStopId(stopId);
+    localStorage.setItem("campusride_selected_stop", stopId);
+  };
 
   const handleTileError = () => {
     tileErrorsRef.current += 1;
@@ -165,15 +199,82 @@ export default function Student() {
     }
   };
 
+  // Demo broadcast event listener (from Admin Demo Controls)
+  useEffect(() => {
+    const handleDemoEvent = (event: string, payload: Record<string, unknown>) => {
+      if (event === "demo_reset") {
+        // Snap buses back to start positions
+        demoProgressRef.current = 0;
+        bus2ProgressRef.current = 0.62; // ~10 min behind on reset
+        setBusPosition(lerpOnRoute(0));
+        setBus2Position(lerpOnRoute(0.62));
+        setCrowdLevel("seats");
+        setOccupancy(0);
+        setBusStatus("on_time");
+        setActiveWaits([]);
+        setIsDemoNetworkLoss(false);
+      } else if (event === "demo_breakdown") {
+        setBusStatus("breakdown");
+      } else if (event === "demo_network_loss") {
+        const duration = (payload.duration as number) || 30;
+        setIsDemoNetworkLoss(true);
+        setLastUpdatedAt(Date.now() - 16000); // Immediately show stale
+        if (demoNetworkLossTimerRef.current) clearTimeout(demoNetworkLossTimerRef.current);
+        demoNetworkLossTimerRef.current = window.setTimeout(() => {
+          setIsDemoNetworkLoss(false);
+          setLastUpdatedAt(Date.now());
+        }, duration * 1000);
+      } else if (event === "demo_speed") {
+        demoSpeedRef.current = (payload.x3 as boolean) ? 3 : 1;
+      }
+    };
+
+    // Supabase Realtime broadcast listener
+    if (demoChannel) {
+      demoChannel.on("broadcast", { event: "demo_reset" }, ({ payload }) => handleDemoEvent("demo_reset", payload || {}));
+      demoChannel.on("broadcast", { event: "demo_breakdown" }, ({ payload }) => handleDemoEvent("demo_breakdown", payload || {}));
+      demoChannel.on("broadcast", { event: "demo_network_loss" }, ({ payload }) => handleDemoEvent("demo_network_loss", payload || {}));
+      demoChannel.on("broadcast", { event: "demo_speed" }, ({ payload }) => handleDemoEvent("demo_speed", payload || {}));
+      demoChannel.on("broadcast", { event: "demo_peak_rush" }, () => { reloadWaits(); });
+    }
+
+    // localStorage cross-tab fallback
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== "campusride_demo_event" || !e.newValue) return;
+      try {
+        const { event, payload } = JSON.parse(e.newValue);
+        handleDemoEvent(event, payload || {});
+        if (event === "demo_peak_rush") reloadWaits();
+      } catch {}
+    };
+    window.addEventListener("storage", onStorage);
+
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      if (demoNetworkLossTimerRef.current) clearTimeout(demoNetworkLossTimerRef.current);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+
   const selectedStop = STOPS.find((s) => s.id === selectedStopId) || STOPS[4];
 
-  // Initialize and check user's existing wait status in localStorage
+  // Device ID for single wait per browser
+  const getDeviceId = () => {
+    let devId = localStorage.getItem("campusride_device_id");
+    if (!devId) {
+      devId = "dev_" + Math.random().toString(36).substring(2, 9) + "_" + Date.now();
+      localStorage.setItem("campusride_device_id", devId);
+    }
+    return devId;
+  };
+
+  // Check user's active wait status in localStorage
   useEffect(() => {
     const savedStop = localStorage.getItem("campusride_wait_stop");
     const savedTime = localStorage.getItem("campusride_wait_time");
     if (savedStop && savedTime) {
       const ageMs = Date.now() - parseInt(savedTime, 10);
-      // Valid if less than 20 mins old
       if (ageMs < 20 * 60 * 1000) {
         setIsUserWaiting(savedStop === selectedStop.name);
       } else {
@@ -200,6 +301,7 @@ export default function Student() {
 
   // Toggle "I'm waiting at this stop"
   const handleToggleWait = async () => {
+    const deviceId = getDeviceId();
     let waitId = localStorage.getItem("campusride_wait_id");
     if (!waitId) {
       waitId = "wait_" + Math.random().toString(36).substring(2, 9) + "_" + Date.now();
@@ -216,7 +318,7 @@ export default function Student() {
       setIsUserWaiting(true);
       localStorage.setItem("campusride_wait_stop", selectedStop.name);
       localStorage.setItem("campusride_wait_time", Date.now().toString());
-      await markStopWait(waitId, selectedStop.name, BUS_ID);
+      await markStopWait(waitId, selectedStop.name, deviceId, BUS_ID);
       reloadWaits();
     }
   };
@@ -229,13 +331,10 @@ export default function Student() {
     return () => clearInterval(timer);
   }, [lastUpdatedAt]);
 
-  // Demo mode bus movement (looping smoothly)
+  // Dead Reckoning & Bus animation loop
+  // In Demo Mode: continuously advances BUS-01 and BUS-02
+  // In Live Mode: if network drops (>15s), dead-reckoning keeps moving bus at 25km/h along route!
   useEffect(() => {
-    if (!isDemoMode) {
-      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-      return;
-    }
-
     lastTickRef.current = Date.now();
 
     const loop = () => {
@@ -243,12 +342,29 @@ export default function Student() {
       const delta = (now - lastTickRef.current) / 1000;
       lastTickRef.current = now;
 
-      const newProgress = (demoProgressRef.current + delta / 120) % 1;
-      demoProgressRef.current = newProgress;
+      // In Demo Mode: advance both buses smoothly at demoSpeedRef rate
+      if (isDemoMode && !isDemoNetworkLoss) {
+        const speedMult = demoSpeedRef.current;
+        const newProgress1 = (demoProgressRef.current + (delta * speedMult) / 120) % 1;
+        demoProgressRef.current = newProgress1;
+        setBusPosition(lerpOnRoute(newProgress1));
 
-      const pos = lerpOnRoute(newProgress);
-      setBusPosition(pos);
-      setLastUpdatedAt(Date.now());
+        const newProgress2 = (bus2ProgressRef.current + (delta * speedMult) / 120) % 1;
+        bus2ProgressRef.current = newProgress2;
+        setBus2Position(lerpOnRoute(newProgress2));
+
+        setLastUpdatedAt(Date.now());
+      } else if (isDemoMode && isDemoNetworkLoss) {
+        // Demo network loss: freeze bus updates (dead reckoning will show on student side)
+      } else {
+        // In Live Mode: if no updates for > 15s, continue dead-reckoning along the route
+        const elapsedSinceUpdate = (now - lastUpdatedAt) / 1000;
+        if (elapsedSinceUpdate > 15) {
+          const deadProgress = (demoProgressRef.current + delta / 120) % 1;
+          demoProgressRef.current = deadProgress;
+          setBusPosition(lerpOnRoute(deadProgress));
+        }
+      }
 
       animationFrameRef.current = requestAnimationFrame(loop);
     };
@@ -258,9 +374,9 @@ export default function Student() {
     return () => {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
     };
-  }, [isDemoMode]);
+  }, [isDemoMode, lastUpdatedAt]);
 
-  // Supabase Realtime synchronization (buses & stop_waits)
+  // Supabase Realtime synchronization
   useEffect(() => {
     if (!isSupabaseConfigured || !supabase) {
       setIsConnected(false);
@@ -277,6 +393,9 @@ export default function Student() {
         if (data && !error) {
           const row = data as BusRow;
           if (row.crowd_level) setCrowdLevel(row.crowd_level);
+          if (row.occupancy !== undefined) setOccupancy(row.occupancy);
+          if (row.status) setBusStatus(row.status);
+          if (row.crowd_source) setCrowdSource(row.crowd_source);
           if (row.lat && row.lng) {
             if (row.is_active) {
               setHasReceivedLiveUpdate(true);
@@ -306,6 +425,9 @@ export default function Student() {
           const updated = payload.new as BusRow;
           if (updated) {
             if (updated.crowd_level) setCrowdLevel(updated.crowd_level);
+            if (updated.occupancy !== undefined) setOccupancy(updated.occupancy);
+            if (updated.status) setBusStatus(updated.status);
+            if (updated.crowd_source) setCrowdSource(updated.crowd_source);
             if (updated.lat && updated.lng) {
               setHasReceivedLiveUpdate(Boolean(updated.is_active));
               if (!isDemoMode) {
@@ -317,7 +439,6 @@ export default function Student() {
         }
       )
       .subscribe((status) => {
-        console.log("[CampusRide Student Realtime Status]:", status);
         setIsConnected(status === "SUBSCRIBED");
       });
 
@@ -343,16 +464,24 @@ export default function Student() {
     };
   }, [isDemoMode]);
 
-  // ETA and distance calculations
-  const remainingKm = isDemoMode
+  // ETA and distance calculations for BUS-01
+  const remainingKm1 = isDemoMode
     ? distanceToStop(demoProgressRef.current, selectedStopId)
     : haversine(busPosition, selectedStop);
-  const etaMins = Math.max(1, Math.round(etaMinutes(remainingKm)));
+  const etaMins1 = Math.max(1, Math.round(etaMinutes(remainingKm1)));
+
+  // ETA for BUS-02 (Next Bus)
+  const remainingKm2 = distanceToStop(bus2ProgressRef.current, selectedStopId);
+  const etaMins2 = Math.max(1, Math.round(etaMinutes(remainingKm2) + 9)); // runs ~9-11 min behind
 
   // Live count waiting at currently selected stop
   const waitingAtSelectedStop = activeWaits.filter(
     (w) => w.stop_name === selectedStop.name
   ).length;
+
+  // Capacity calculation (50 max)
+  const seatsRemaining = Math.max(0, 50 - occupancy);
+  const isCrowdShortage = waitingAtSelectedStop > seatsRemaining && seatsRemaining < 15;
 
   // Calculate covered vs remaining segments along the route
   const routeSegments = getRouteSegments(
@@ -383,7 +512,7 @@ export default function Student() {
   };
 
   const crowdBadge = crowdStyles[crowdLevel] || crowdStyles.seats;
-  const isWeakNetwork = secondsAgo > 30;
+  const isWeakNetwork = secondsAgo > 15;
 
   return (
     <div className="relative w-full h-[calc(100dvh-56px)] overflow-hidden bg-gray-950" style={{ height: "calc(100dvh - 56px)" }}>
@@ -397,22 +526,17 @@ export default function Student() {
           className="w-full h-full"
           style={{ height: "100%", width: "100%" }}
         >
-          {/* Zoom controls at top right */}
           <ZoomControl position="topright" />
 
           {/* Esri Dark Canvas with OpenStreetMap automatic fallback */}
           {!useOsmFallback ? (
             <>
-              {/* Esri Dark Gray Base */}
               <TileLayer
                 attribution="Tiles &copy; Esri"
                 url="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}"
                 maxZoom={16}
-                eventHandlers={{
-                  tileerror: handleTileError,
-                }}
+                eventHandlers={{ tileerror: handleTileError }}
               />
-              {/* Esri Dark Gray Reference Labels on top */}
               <TileLayer
                 attribution="Tiles &copy; Esri"
                 url="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}"
@@ -421,7 +545,6 @@ export default function Student() {
               />
             </>
           ) : (
-            /* Automatic fallback to standard OpenStreetMap */
             <TileLayer
               attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
               url="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -467,7 +590,7 @@ export default function Student() {
               position={[stop.lat, stop.lng]}
               icon={createStopIcon(idx, stop.id === selectedStopId)}
               eventHandlers={{
-                click: () => setSelectedStopId(stop.id),
+                click: () => handleSelectStop(stop.id),
               }}
             >
               <Popup>
@@ -476,24 +599,42 @@ export default function Student() {
                     Stop #{idx + 1}: {stop.name}
                   </div>
                   <div className="text-xs text-gray-300 mt-1">
-                    {stop.id === selectedStopId
-                      ? "Selected stop"
-                      : "Tap to select this stop"}
+                    {stop.id === selectedStopId ? "Selected destination" : "Tap to select destination"}
                   </div>
                 </div>
               </Popup>
             </Marker>
           ))}
 
-          {/* Bus Marker */}
-          <Marker position={[busPosition.lat, busPosition.lng]} icon={createBusIcon(busPosition.bearing || 0)}>
+          {/* BUS-01 Marker (with dead-reckoning fade if weak network) */}
+          <Marker
+            position={[busPosition.lat, busPosition.lng]}
+            icon={createBusIcon(busPosition.bearing || 0, false, !isDemoMode && isWeakNetwork)}
+          >
             <Popup>
               <div className="text-gray-100 p-1">
                 <div className="font-bold text-sm text-indigo-400">{BUS_ID} (Campus Express)</div>
-                <div className="text-xs text-gray-300 mt-1">Status: {crowdBadge.label}</div>
+                <div className="text-xs text-gray-300 mt-0.5">Occupancy: {occupancy}/50</div>
+                <div className="text-xs text-gray-300">Status: {crowdBadge.label}</div>
               </div>
             </Popup>
           </Marker>
+
+          {/* BUS-02 Marker in Demo Mode (Running ~10 min behind) */}
+          {isDemoMode && (
+            <Marker
+              position={[bus2Position.lat, bus2Position.lng]}
+              icon={createBusIcon(bus2Position.bearing || 0, true, false)}
+            >
+              <Popup>
+                <div className="text-gray-100 p-1">
+                  <div className="font-bold text-sm text-purple-400">BUS-02 (Campus Shuttle 2)</div>
+                  <div className="text-xs text-gray-300 mt-0.5">Following ~10 min behind</div>
+                  <div className="text-xs text-emerald-400">Seats available</div>
+                </div>
+              </Popup>
+            </Marker>
+          )}
         </MapContainer>
       </div>
 
@@ -503,6 +644,23 @@ export default function Student() {
           className="pointer-events-auto w-full sm:max-w-[420px] bg-gray-950/95 backdrop-blur-xl border-t sm:border border-gray-800 rounded-t-3xl sm:rounded-2xl p-4 sm:p-5 shadow-2xl space-y-3 sm:mb-4"
           style={{ paddingBottom: "max(1.25rem, env(safe-area-inset-bottom))" }}
         >
+          {/* Dismissable First-Time Hint for Students */}
+          {showHint && (
+            <div className="bg-indigo-950/70 border border-indigo-800/60 rounded-xl px-3 py-1.5 text-xs text-indigo-200 flex items-center justify-between">
+              <span>Pick your stop to see when the bus will arrive.</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowHint(false);
+                  localStorage.setItem("campusride_student_hint_dismissed", "1");
+                }}
+                className="text-indigo-400 hover:text-white ml-2 font-bold px-1"
+              >
+                ✕
+              </button>
+            </div>
+          )}
+
           {/* Bottom Sheet Drag Indicator & Realtime status */}
           <div className="flex items-center justify-between">
             <div className="w-10 h-1 bg-gray-700 rounded-full sm:hidden" />
@@ -520,7 +678,6 @@ export default function Student() {
 
           {/* Integrated Controls Row: Stop Selector & Demo/Live Toggle */}
           <div className="flex items-center gap-2">
-            {/* My Stop Dropdown (min 44px height) */}
             <div className="flex-1 min-w-0">
               <label htmlFor="bottom-stop-select" className="sr-only">
                 Select My Stop
@@ -529,7 +686,7 @@ export default function Student() {
                 <select
                   id="bottom-stop-select"
                   value={selectedStopId}
-                  onChange={(e) => setSelectedStopId(e.target.value)}
+                  onChange={(e) => handleSelectStop(e.target.value)}
                   className="w-full h-11 bg-gray-900 border border-gray-800 text-white text-xs sm:text-sm font-medium rounded-xl px-3 pr-8 appearance-none focus:outline-none focus:border-indigo-500 transition-colors truncate"
                 >
                   {STOPS.map((s, idx) => (
@@ -546,15 +703,12 @@ export default function Student() {
               </div>
             </div>
 
-            {/* Demo / Live Toggle (min 44px height) */}
             <div className="h-11 bg-gray-900 border border-gray-800 rounded-xl p-1 flex items-center shrink-0">
               <button
                 type="button"
                 onClick={() => setIsDemoMode(true)}
                 className={`h-full px-2.5 sm:px-3 rounded-lg text-xs font-semibold transition-all ${
-                  isDemoMode
-                    ? "bg-indigo-600 text-white shadow-sm"
-                    : "text-gray-400 hover:text-gray-200"
+                  isDemoMode ? "bg-indigo-600 text-white shadow-sm" : "text-gray-400 hover:text-gray-200"
                 }`}
               >
                 Demo
@@ -563,30 +717,58 @@ export default function Student() {
                 type="button"
                 onClick={() => {
                   if (!isSupabaseConfigured) {
-                    alert("Supabase is not configured yet. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env to enable Live GPS mode.");
+                    alert("Supabase not configured. Add keys in .env to enable Live Mode.");
                     return;
                   }
                   setIsDemoMode(false);
                 }}
                 className={`h-full px-2.5 sm:px-3 rounded-lg text-xs font-semibold transition-all ${
-                  !isDemoMode
-                    ? "bg-indigo-600 text-white shadow-sm"
-                    : "text-gray-400 hover:text-gray-200"
+                  !isDemoMode ? "bg-indigo-600 text-white shadow-sm" : "text-gray-400 hover:text-gray-200"
                 }`}
-                title={!isSupabaseConfigured ? "Connect Supabase to enable Live Mode" : "Switch to Live GPS"}
+                title="Live Mode"
               >
                 Live
               </button>
             </div>
           </div>
 
-          {/* Weak network warning banner if > 30s */}
-          {isWeakNetwork && (
+          {/* Operational Status Alerts (Breakdown / Delayed) */}
+          {busStatus === "breakdown" && (
+            <div className="bg-rose-950/90 border border-rose-800 rounded-xl p-3 text-xs text-rose-200 space-y-0.5">
+              <div className="font-bold flex items-center gap-1.5 text-rose-300">
+                <span>⚠️</span> BUS-01 reported a breakdown
+              </div>
+              <p>Next bus (BUS-02) arriving in ~{etaMins2} min.</p>
+            </div>
+          )}
+
+          {busStatus === "delayed" && (
+            <div className="bg-amber-950/80 border border-amber-800/70 rounded-xl p-2.5 text-xs text-amber-200 flex items-center gap-2">
+              <span className="text-amber-400 font-bold">⏱</span>
+              <span>BUS-01 is delayed by heavy traffic.</span>
+            </div>
+          )}
+
+          {/* Dead Reckoning / Weak Network Warning Banner */}
+          {!isDemoMode && isWeakNetwork && (
             <div className="flex items-center gap-2 bg-amber-950/80 border border-amber-800/60 rounded-xl px-3 py-2 text-xs text-amber-300">
               <svg className="w-4 h-4 shrink-0 text-amber-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
               </svg>
-              <span>Weak network, showing last known location</span>
+              <span>Estimated position, weak network ({secondsAgo}s ago)</span>
+            </div>
+          )}
+
+          {/* Peak Hour Shortage Alert: Waiting > Remaining Seats */}
+          {isCrowdShortage && (
+            <div className="bg-amber-950/80 border border-amber-800/80 rounded-xl p-2.5 text-xs text-amber-200 flex items-start gap-2">
+              <span className="text-amber-400 font-bold mt-0.5">⚠️</span>
+              <div>
+                <p className="font-semibold text-amber-300">High Demand Warning</p>
+                <p className="text-[11px] text-amber-400/90 mt-0.5">
+                  This bus may be full when it reaches you ({seatsRemaining} seats left). Next bus in ~{etaMins2} min.
+                </p>
+              </div>
             </div>
           )}
 
@@ -622,11 +804,17 @@ export default function Student() {
                     </span>
                   </div>
                 </div>
+
                 <div className="text-right shrink-0">
                   <span className="text-3xl sm:text-4xl font-extrabold text-indigo-400 tracking-tight">
-                    ~{etaMins}
+                    ~{etaMins1}
                   </span>
                   <span className="text-xs text-gray-400 font-semibold ml-1.5">min</span>
+                  {isDemoMode && (
+                    <div className="text-[11px] text-purple-400 font-medium mt-0.5">
+                      Next in ~{etaMins2}m
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -658,26 +846,30 @@ export default function Student() {
                 )}
               </button>
 
-              {/* Details Row: Distance, Crowd Badge, Network status */}
-              <div className="pt-2 border-t border-gray-800/80 flex items-center justify-between text-xs">
-                <div className="flex items-center gap-2.5">
+              {/* Details Row: Distance, Estimated Occupancy & Crowd Badge */}
+              <div className="pt-2 border-t border-gray-800/80 flex items-center justify-between text-xs flex-wrap gap-2">
+                <div className="flex items-center gap-2">
                   <div className="flex items-center gap-1.5 text-gray-300 font-medium">
                     <svg className="w-3.5 h-3.5 text-gray-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <path d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l5.447 2.724A1 1 0 0021 18.382V7.618a1 1 0 00-1.447-.894L15 4m0 13V4m0 0L9 7" />
                     </svg>
-                    <span>{remainingKm.toFixed(1)} km</span>
+                    <span>{remainingKm1.toFixed(1)} km</span>
                   </div>
 
-                  {/* Crowd Badge */}
-                  <div className={`px-2.5 py-1 rounded-full border ${crowdBadge.bg} ${crowdBadge.border} ${crowdBadge.text} font-semibold flex items-center gap-1.5 text-[11px]`}>
-                    <span className="w-1.5 h-1.5 rounded-full bg-current"></span>
-                    <span>{crowdBadge.label}</span>
+                  <div className="text-[11px] text-gray-400">
+                    Estimated {occupancy}/50 on board
                   </div>
                 </div>
 
-                {/* Last updated indicator */}
-                <div className="text-gray-400 text-[11px] shrink-0 font-medium">
-                  {secondsAgo === 0 ? "Just now" : `${secondsAgo}s ago`}
+                {/* Crowd Badge with Auto / Driver indicator */}
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <div className={`px-2.5 py-1 rounded-full border ${crowdBadge.bg} ${crowdBadge.border} ${crowdBadge.text} font-semibold flex items-center gap-1 text-[11px]`}>
+                    <span className="w-1.5 h-1.5 rounded-full bg-current"></span>
+                    <span>{crowdBadge.label}</span>
+                  </div>
+                  <span className="text-[10px] text-gray-500 font-medium">
+                    ({crowdSource === "auto" ? "Auto" : "Set by driver"})
+                  </span>
                 </div>
               </div>
             </>

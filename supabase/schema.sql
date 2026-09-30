@@ -151,8 +151,11 @@ CREATE TABLE IF NOT EXISTS public.stop_waits (
   id TEXT PRIMARY KEY,
   bus_id TEXT NOT NULL DEFAULT 'BUS-01',
   stop_name TEXT NOT NULL,
+  device_id TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE public.stop_waits ADD COLUMN IF NOT EXISTS device_id TEXT NOT NULL DEFAULT '';
 
 -- Enable Row Level Security
 ALTER TABLE public.stop_waits ENABLE ROW LEVEL SECURITY;
@@ -177,3 +180,16 @@ BEGIN
     ALTER PUBLICATION supabase_realtime ADD TABLE public.stop_waits;
   END IF;
 END $$;
+
+-- 8. Add capacity, occupancy, operational status, crowd_source to buses
+ALTER TABLE public.buses 
+ADD COLUMN IF NOT EXISTS capacity INTEGER NOT NULL DEFAULT 50,
+ADD COLUMN IF NOT EXISTS occupancy INTEGER NOT NULL DEFAULT 0,
+ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'on_time' CHECK (status IN ('on_time', 'delayed', 'breakdown')),
+ADD COLUMN IF NOT EXISTS crowd_source TEXT NOT NULL DEFAULT 'auto' CHECK (crowd_source IN ('auto', 'manual'));
+
+-- Seed BUS-02 running on the same route
+INSERT INTO public.buses (id, name, route_name, lat, lng, crowd_level, is_active, capacity, occupancy, status, crowd_source, updated_at)
+VALUES ('BUS-02', 'Campus Shuttle 2', 'City Route 1', 18.520374, 73.856481, 'seats', true, 50, 18, 'on_time', 'auto', NOW())
+ON CONFLICT (id) DO UPDATE 
+SET capacity = 50, updated_at = NOW();
