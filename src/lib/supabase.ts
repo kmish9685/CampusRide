@@ -36,6 +36,13 @@ export interface BusRow {
   updated_at: string;
 }
 
+export interface StopWait {
+  id: string;
+  bus_id: string;
+  stop_name: string;
+  created_at: string;
+}
+
 /**
  * Upsert bus record. Guarantees BUS-01 is created if missing, and updated otherwise.
  */
@@ -50,4 +57,38 @@ export async function upsertBus(payload: Partial<BusRow> & { id: string }) {
     },
     { onConflict: "id" }
   );
+}
+
+/**
+ * Fetch active student waits within last 20 minutes.
+ */
+export async function fetchActiveWaits(busId = "BUS-01") {
+  if (!supabase) return { data: [] as StopWait[], error: null };
+  const cutoff = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+  return supabase
+    .from("stop_waits")
+    .select("*")
+    .eq("bus_id", busId)
+    .gte("created_at", cutoff);
+}
+
+/**
+ * Mark student as waiting at a stop.
+ */
+export async function markStopWait(waitId: string, stopName: string, busId = "BUS-01") {
+  if (!supabase) return { data: null, error: new Error("Supabase is not configured") };
+  return supabase.from("stop_waits").upsert({
+    id: waitId,
+    bus_id: busId,
+    stop_name: stopName,
+    created_at: new Date().toISOString(),
+  });
+}
+
+/**
+ * Cancel student wait.
+ */
+export async function cancelStopWait(waitId: string) {
+  if (!supabase) return { data: null, error: new Error("Supabase is not configured") };
+  return supabase.from("stop_waits").delete().eq("id", waitId);
 }

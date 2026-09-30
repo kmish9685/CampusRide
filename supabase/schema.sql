@@ -145,3 +145,35 @@ VALUES
   ('BUS-01', 'Residential Colony',    NOW() - INTERVAL '1 days' + INTERVAL '18 hour 30 min', NOW() - INTERVAL '1 days' + INTERVAL '18 hour 36 min', 10, NOW()),
   ('BUS-01', 'Market Square',         NOW() - INTERVAL '1 days' + INTERVAL '18 hour 45 min', NOW() - INTERVAL '1 days' + INTERVAL '18 hour 51 min', 8, NOW()),
   ('BUS-01', 'City Bus Stand',        NOW() - INTERVAL '1 days' + INTERVAL '19 hour 00 min', NOW() - INTERVAL '1 days' + INTERVAL '19 hour 07 min', 4, NOW());
+
+-- 7. Create table 'stop_waits' for live student demand
+CREATE TABLE IF NOT EXISTS public.stop_waits (
+  id TEXT PRIMARY KEY,
+  bus_id TEXT NOT NULL DEFAULT 'BUS-01',
+  stop_name TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Enable Row Level Security
+ALTER TABLE public.stop_waits ENABLE ROW LEVEL SECURITY;
+
+-- Allow anon select, insert, delete
+DROP POLICY IF EXISTS "Allow anon read stop_waits" ON public.stop_waits;
+CREATE POLICY "Allow anon read stop_waits" ON public.stop_waits FOR SELECT TO anon USING (true);
+
+DROP POLICY IF EXISTS "Allow anon insert stop_waits" ON public.stop_waits;
+CREATE POLICY "Allow anon insert stop_waits" ON public.stop_waits FOR INSERT TO anon WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Allow anon delete stop_waits" ON public.stop_waits;
+CREATE POLICY "Allow anon delete stop_waits" ON public.stop_waits FOR DELETE TO anon USING (true);
+
+-- Enable Supabase Realtime on stop_waits
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_publication_tables 
+    WHERE pubname = 'supabase_realtime' AND tablename = 'stop_waits'
+  ) THEN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.stop_waits;
+  END IF;
+END $$;

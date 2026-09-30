@@ -1,9 +1,18 @@
 import React, { useState, useEffect, useRef } from "react";
 import { MapContainer, TileLayer, Polyline, Marker, Popup, useMap, ZoomControl } from "react-leaflet";
 import L from "leaflet";
-import { STOPS, ROUTE_POLYLINE, MAP_CENTER, MAP_ZOOM, type RoutePoint } from "../data/route";
+import { STOPS, ROUTE_POLYLINE, MAP_CENTER, MAP_ZOOM, BUS_ID, type RoutePoint } from "../data/route";
 import { lerpOnRoute, distanceToStop, etaMinutes, haversine, getRouteSegments } from "../lib/routeUtils";
-import { supabase, isSupabaseConfigured, type CrowdLevel, type BusRow } from "../lib/supabase";
+import {
+  supabase,
+  isSupabaseConfigured,
+  type CrowdLevel,
+  type BusRow,
+  type StopWait,
+  fetchActiveWaits,
+  markStopWait,
+  cancelStopWait,
+} from "../lib/supabase";
 
 // Modern SVG-based DivIcons for stops
 const createStopIcon = (index: number, isSelected: boolean) => {
@@ -67,13 +76,11 @@ function MapLifecycle() {
   const hasFitBoundsRef = useRef(false);
 
   useEffect(() => {
-    // Initial size calculation
     map.invalidateSize();
     const timer = setTimeout(() => {
       map.invalidateSize();
     }, 250);
 
-    // Initial fitBounds with extra bottom padding for the bottom sheet card
     if (!hasFitBoundsRef.current) {
       const bounds = L.latLngBounds(ROUTE_POLYLINE.map((p) => [p.lat, p.lng]));
       map.fitBounds(bounds, {
@@ -139,8 +146,18 @@ export default function Student() {
   const [crowdLevel, setCrowdLevel] = useState<CrowdLevel>("seats");
   const [lastUpdatedAt, setLastUpdatedAt] = useState<number>(Date.now());
   const [secondsAgo, setSecondsAgo] = useState<number>(0);
+  const [isConnected, setIsConnected] = useState<boolean>(false);
+  const [hasReceivedLiveUpdate, setHasReceivedLiveUpdate] = useState<boolean>(false);
   const [useOsmFallback, setUseOsmFallback] = useState<boolean>(false);
+
+  // Demand / Stop Wait State
+  const [activeWaits, setActiveWaits] = useState<StopWait[]>([]);
+  const [isUserWaiting, setIsUserWaiting] = useState<boolean>(false);
+
   const tileErrorsRef = useRef<number>(0);
+  const demoProgressRef = useRef<number>(0);
+  const animationFrameRef = useRef<number | null>(null);
+  const lastTickRef = useRef<number>(Date.now());
 
   const handleTileError = () => {
     tileErrorsRef.current += 1;
@@ -149,10 +166,61 @@ export default function Student() {
     }
   };
 
-  // Demo loop animation: 120 seconds full loop
-  const demoProgressRef = useRef<number>(0);
-  const animationFrameRef = useRef<number | null>(null);
-  const lastTickRef = useRef<number>(Date.now());
+  const selectedStop = STOPS.find((s) => s.id === selectedStopId) || STOPS[4];
+
+  // Initialize and check user's existing wait status in localStorage
+  useEffect(() => {
+    const savedStop = localStorage.getItem("campusride_wait_stop");
+    const savedTime = localStorage.getItem("campusride_wait_time");
+    if (savedStop && savedTime) {
+      const ageMs = Date.now() - parseInt(savedTime, 10);
+      // Valid if less than 20 mins old
+      if (ageMs < 20 * 60 * 1000) {
+        setIsUserWaiting(savedStop === selectedStop.name);
+      } else {
+        localStorage.removeItem("campusride_wait_stop");
+        localStorage.removeItem("campusride_wait_time");
+        setIsUserWaiting(false);
+      }
+    } else {
+      setIsUserWaiting(false);
+    }
+  }, [selectedStop.name]);
+
+  // Fetch active waits from database
+  const reloadWaits = async () => {
+    try {
+      const { data } = await fetchActiveWaits(BUS_ID);
+      if (data) {
+        setActiveWaits(data as StopWait[]);
+      }
+    } catch (err) {
+      console.warn("Error fetching active waits:", err);
+    }
+  };
+
+  // Toggle "I'm waiting at this stop"
+  const handleToggleWait = async () => {
+    let waitId = localStorage.getItem("campusride_wait_id");
+    if (!waitId) {
+      waitId = "wait_" + Math.random().toString(36).substring(2, 9) + "_" + Date.now();
+      localStorage.setItem("campusride_wait_id", waitId);
+    }
+
+    if (isUserWaiting) {
+      setIsUserWaiting(false);
+      localStorage.removeItem("campusride_wait_stop");
+      localStorage.removeItem("campusride_wait_time");
+      await cancelStopWait(waitId);
+      reloadWaits();
+    } else {
+      setIsUserWaiting(true);
+      localStorage.setItem("campusride_wait_stop", selectedStop.name);
+      localStorage.setItem("campusride_wait_time", Date.now().toString());
+      await markStopWait(waitId, selectedStop.name, BUS_ID);
+      reloadWaits();
+    }
+  };
 
   // Seconds ago timer
   useEffect(() => {
@@ -162,7 +230,7 @@ export default function Student() {
     return () => clearInterval(timer);
   }, [lastUpdatedAt]);
 
-  // Demo mode bus movement
+  // Demo mode bus movement (looping smoothly)
   useEffect(() => {
     if (!isDemoMode) {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
@@ -193,69 +261,99 @@ export default function Student() {
     };
   }, [isDemoMode]);
 
-  // Supabase Realtime synchronization
+  // Supabase Realtime synchronization (buses & stop_waits)
   useEffect(() => {
-    if (!isSupabaseConfigured || !supabase) return;
+    if (!isSupabaseConfigured || !supabase) {
+      setIsConnected(false);
+      return;
+    }
 
-    const fetchBus = async () => {
-      try {
-        const { data, error } = await supabase!
-          .from("buses")
-          .select("*")
-          .eq("id", "BUS-01")
-          .single();
-
+    // Initial fetch of current bus row & active waits
+    supabase
+      .from("buses")
+      .select("*")
+      .eq("id", BUS_ID)
+      .maybeSingle()
+      .then(({ data, error }) => {
         if (data && !error) {
           const row = data as BusRow;
-          setCrowdLevel(row.crowd_level);
-          if (!isDemoMode && row.lat && row.lng) {
-            setBusPosition({ lat: row.lat, lng: row.lng });
-            setLastUpdatedAt(new Date(row.updated_at).getTime() || Date.now());
+          if (row.crowd_level) setCrowdLevel(row.crowd_level);
+          if (row.lat && row.lng) {
+            if (row.is_active) {
+              setHasReceivedLiveUpdate(true);
+              if (!isDemoMode) {
+                setBusPosition({ lat: row.lat, lng: row.lng });
+                setLastUpdatedAt(new Date(row.updated_at).getTime() || Date.now());
+              }
+            }
           }
         }
-      } catch (err) {
-        console.warn("Supabase fetch error:", err);
-      }
-    };
+      });
 
-    fetchBus();
+    reloadWaits();
 
-    const channel = supabase
-      .channel("student-bus-tracker")
+    // Realtime channel for buses
+    const busChannel = supabase
+      .channel("student-buses-sync")
       .on(
         "postgres_changes",
         {
           event: "*",
           schema: "public",
           table: "buses",
-          filter: "id=eq.BUS-01",
+          filter: `id=eq.${BUS_ID}`,
         },
         (payload) => {
           const updated = payload.new as BusRow;
           if (updated) {
-            if (updated.crowd_level) {
-              setCrowdLevel(updated.crowd_level);
-            }
-            if (!isDemoMode && updated.lat && updated.lng) {
-              setBusPosition({ lat: updated.lat, lng: updated.lng });
-              setLastUpdatedAt(Date.now());
+            if (updated.crowd_level) setCrowdLevel(updated.crowd_level);
+            if (updated.lat && updated.lng) {
+              setHasReceivedLiveUpdate(Boolean(updated.is_active));
+              if (!isDemoMode) {
+                setBusPosition({ lat: updated.lat, lng: updated.lng });
+                setLastUpdatedAt(Date.now());
+              }
             }
           }
+        }
+      )
+      .subscribe((status) => {
+        console.log("[CampusRide Student Realtime Status]:", status);
+        setIsConnected(status === "SUBSCRIBED");
+      });
+
+    // Realtime channel for stop_waits
+    const waitsChannel = supabase
+      .channel("student-waits-realtime")
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "stop_waits",
+        },
+        () => {
+          reloadWaits();
         }
       )
       .subscribe();
 
     return () => {
-      supabase!.removeChannel(channel);
+      supabase?.removeChannel(busChannel);
+      supabase?.removeChannel(waitsChannel);
     };
   }, [isDemoMode]);
 
   // ETA and distance calculations
-  const selectedStop = STOPS.find((s) => s.id === selectedStopId) || STOPS[4];
   const remainingKm = isDemoMode
     ? distanceToStop(demoProgressRef.current, selectedStopId)
     : haversine(busPosition, selectedStop);
   const etaMins = Math.max(1, Math.round(etaMinutes(remainingKm)));
+
+  // Live count waiting at currently selected stop
+  const waitingAtSelectedStop = activeWaits.filter(
+    (w) => w.stop_name === selectedStop.name
+  ).length;
 
   // Calculate covered vs remaining segments along the route
   const routeSegments = getRouteSegments(
@@ -392,7 +490,7 @@ export default function Student() {
           <Marker position={[busPosition.lat, busPosition.lng]} icon={createBusIcon()}>
             <Popup>
               <div className="text-gray-100 p-1">
-                <div className="font-bold text-sm text-indigo-400">BUS-01 (Campus Express)</div>
+                <div className="font-bold text-sm text-indigo-400">{BUS_ID} (Campus Express)</div>
                 <div className="text-xs text-gray-300 mt-1">Status: {crowdBadge.label}</div>
               </div>
             </Popup>
@@ -403,13 +501,25 @@ export default function Student() {
       {/* Fixed Bottom Sheet (Uber/Rapido style) */}
       <div className="absolute bottom-0 left-0 right-0 z-[1000] pointer-events-none flex justify-center">
         <div
-          className="pointer-events-auto w-full sm:max-w-[420px] bg-gray-950/95 backdrop-blur-xl border-t sm:border border-gray-800 rounded-t-3xl sm:rounded-2xl p-4 sm:p-5 shadow-2xl space-y-3.5 sm:mb-4"
+          className="pointer-events-auto w-full sm:max-w-[420px] bg-gray-950/95 backdrop-blur-xl border-t sm:border border-gray-800 rounded-t-3xl sm:rounded-2xl p-4 sm:p-5 shadow-2xl space-y-3 sm:mb-4"
           style={{ paddingBottom: "max(1.25rem, env(safe-area-inset-bottom))" }}
         >
-          {/* Bottom Sheet Drag Indicator (mobile) */}
-          <div className="w-12 h-1 bg-gray-700 rounded-full mx-auto sm:hidden" />
+          {/* Bottom Sheet Drag Indicator & Realtime status */}
+          <div className="flex items-center justify-between">
+            <div className="w-10 h-1 bg-gray-700 rounded-full sm:hidden" />
+            <div className="flex items-center gap-1.5 text-[11px] text-gray-400 ml-auto">
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  isConnected ? "bg-emerald-400 animate-pulse" : "bg-gray-500"
+                }`}
+              />
+              <span className="font-medium">
+                {isConnected ? "Connected" : "Offline"}
+              </span>
+            </div>
+          </div>
 
-          {/* Integrated Controls Row: Stop Selector & Demo/Live Toggle inside bottom card */}
+          {/* Integrated Controls Row: Stop Selector & Demo/Live Toggle */}
           <div className="flex items-center gap-2">
             {/* My Stop Dropdown (min 44px height) */}
             <div className="flex-1 min-w-0">
@@ -481,46 +591,98 @@ export default function Student() {
             </div>
           )}
 
-          {/* Primary ETA Display */}
-          <div className="flex items-center justify-between pt-1">
-            <div className="min-w-0 pr-2">
-              <p className="text-[11px] uppercase tracking-wider text-gray-400 font-semibold">
-                Bus arriving at
+          {/* Live Mode "Waiting for driver" state */}
+          {!isDemoMode && !hasReceivedLiveUpdate ? (
+            <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 text-center space-y-1">
+              <p className="text-sm font-semibold text-white">Waiting for driver to start trip</p>
+              <p className="text-xs text-gray-400">
+                Switch to Demo Mode above to preview simulated movement, or tap Start Trip on the Driver page.
               </p>
-              <h2 className="text-base sm:text-lg font-bold text-white tracking-tight truncate">
-                {selectedStop.name}
-              </h2>
             </div>
-            <div className="text-right shrink-0">
-              <span className="text-3xl sm:text-4xl font-extrabold text-indigo-400 tracking-tight">
-                ~{etaMins}
-              </span>
-              <span className="text-xs text-gray-400 font-semibold ml-1.5">min</span>
-            </div>
-          </div>
-
-          {/* Details Row: Distance, Crowd Badge, Network status */}
-          <div className="pt-2 border-t border-gray-800/80 flex items-center justify-between text-xs">
-            <div className="flex items-center gap-2.5">
-              <div className="flex items-center gap-1.5 text-gray-300 font-medium">
-                <svg className="w-3.5 h-3.5 text-gray-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l5.447 2.724A1 1 0 0021 18.382V7.618a1 1 0 00-1.447-.894L15 4m0 13V4m0 0L9 7" />
-                </svg>
-                <span>{remainingKm.toFixed(1)} km</span>
+          ) : (
+            <>
+              {/* Primary ETA Display */}
+              <div className="flex items-start justify-between pt-1">
+                <div className="min-w-0 pr-2">
+                  <p className="text-[11px] uppercase tracking-wider text-gray-400 font-semibold">
+                    Bus arriving at
+                  </p>
+                  <h2 className="text-base sm:text-lg font-bold text-white tracking-tight truncate">
+                    {selectedStop.name}
+                  </h2>
+                  {/* Students waiting count under ETA */}
+                  <div className="flex items-center gap-1.5 text-xs text-indigo-300 font-medium mt-0.5">
+                    <svg className="w-3.5 h-3.5 text-indigo-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" />
+                      <circle cx="9" cy="7" r="4" />
+                      <path d="M23 21v-2a4 4 0 00-3-3.87" />
+                      <path d="M16 3.13a4 4 0 010 7.75" />
+                    </svg>
+                    <span>
+                      {waitingAtSelectedStop} {waitingAtSelectedStop === 1 ? "student" : "students"} waiting here
+                    </span>
+                  </div>
+                </div>
+                <div className="text-right shrink-0">
+                  <span className="text-3xl sm:text-4xl font-extrabold text-indigo-400 tracking-tight">
+                    ~{etaMins}
+                  </span>
+                  <span className="text-xs text-gray-400 font-semibold ml-1.5">min</span>
+                </div>
               </div>
 
-              {/* Crowd Badge */}
-              <div className={`px-2.5 py-1 rounded-full border ${crowdBadge.bg} ${crowdBadge.border} ${crowdBadge.text} font-semibold flex items-center gap-1.5 text-[11px]`}>
-                <span className="w-1.5 h-1.5 rounded-full bg-current"></span>
-                <span>{crowdBadge.label}</span>
-              </div>
-            </div>
+              {/* Waiting Button: "I'm waiting at this stop" / "You're marked as waiting" */}
+              <button
+                type="button"
+                onClick={handleToggleWait}
+                className={`w-full min-h-[44px] rounded-xl font-semibold text-xs sm:text-sm flex items-center justify-center gap-2 transition-all shadow-md ${
+                  isUserWaiting
+                    ? "bg-emerald-950/80 border border-emerald-500/60 text-emerald-300 hover:bg-emerald-900/60"
+                    : "bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-950/50 active:scale-[0.98]"
+                }`}
+              >
+                {isUserWaiting ? (
+                  <>
+                    <svg className="w-4 h-4 text-emerald-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                      <polyline points="20 6 9 17 4 12" />
+                    </svg>
+                    <span>You're marked as waiting (Tap to cancel)</span>
+                  </>
+                ) : (
+                  <>
+                    <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <circle cx="12" cy="12" r="10" />
+                      <polyline points="12 6 12 12 16 14" />
+                    </svg>
+                    <span>I'm waiting at this stop</span>
+                  </>
+                )}
+              </button>
 
-            {/* Last updated indicator */}
-            <div className="text-gray-400 text-[11px] shrink-0 font-medium">
-              {secondsAgo === 0 ? "Just now" : `${secondsAgo}s ago`}
-            </div>
-          </div>
+              {/* Details Row: Distance, Crowd Badge, Network status */}
+              <div className="pt-2 border-t border-gray-800/80 flex items-center justify-between text-xs">
+                <div className="flex items-center gap-2.5">
+                  <div className="flex items-center gap-1.5 text-gray-300 font-medium">
+                    <svg className="w-3.5 h-3.5 text-gray-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l5.447 2.724A1 1 0 0021 18.382V7.618a1 1 0 00-1.447-.894L15 4m0 13V4m0 0L9 7" />
+                    </svg>
+                    <span>{remainingKm.toFixed(1)} km</span>
+                  </div>
+
+                  {/* Crowd Badge */}
+                  <div className={`px-2.5 py-1 rounded-full border ${crowdBadge.bg} ${crowdBadge.border} ${crowdBadge.text} font-semibold flex items-center gap-1.5 text-[11px]`}>
+                    <span className="w-1.5 h-1.5 rounded-full bg-current"></span>
+                    <span>{crowdBadge.label}</span>
+                  </div>
+                </div>
+
+                {/* Last updated indicator */}
+                <div className="text-gray-400 text-[11px] shrink-0 font-medium">
+                  {secondsAgo === 0 ? "Just now" : `${secondsAgo}s ago`}
+                </div>
+              </div>
+            </>
+          )}
         </div>
       </div>
     </div>

@@ -54,7 +54,7 @@ export default function Driver() {
       });
 
     return () => {
-      supabase.removeChannel(channel);
+      supabase?.removeChannel(channel);
     };
   }, []);
 
