@@ -1,6 +1,14 @@
 import React, { useState, useEffect, useRef } from "react";
-import { supabase, isSupabaseConfigured, upsertBus, type CrowdLevel, type BusRow } from "../lib/supabase";
-import { BUS_ID, ROUTE_POLYLINE } from "../data/route";
+import {
+  supabase,
+  isSupabaseConfigured,
+  upsertBus,
+  type CrowdLevel,
+  type BusRow,
+  type StopWait,
+  fetchActiveWaits,
+} from "../lib/supabase";
+import { BUS_ID, ROUTE_POLYLINE, STOPS } from "../data/route";
 import { lerpOnRoute } from "../lib/routeUtils";
 
 export default function Driver() {
@@ -9,6 +17,7 @@ export default function Driver() {
   const [crowdLevel, setCrowdLevel] = useState<CrowdLevel>("seats");
   const [saveFeedback, setSaveFeedback] = useState<string | null>(null);
   const [isConnected, setIsConnected] = useState<boolean>(false);
+  const [activeWaits, setActiveWaits] = useState<StopWait[]>([]);
   const [gpsLocation, setGpsLocation] = useState<{
     lat: number;
     lng: number;
@@ -23,6 +32,18 @@ export default function Driver() {
   const simIntervalRef = useRef<number | null>(null);
   const simProgressRef = useRef<number>(0);
 
+  // Fetch active student waits
+  const reloadWaits = async () => {
+    try {
+      const { data } = await fetchActiveWaits(BUS_ID);
+      if (data) {
+        setActiveWaits(data as StopWait[]);
+      }
+    } catch (err) {
+      console.warn("Error fetching driver active waits:", err);
+    }
+  };
+
   // Supabase Realtime channel status & initial fetch
   useEffect(() => {
     if (!isSupabaseConfigured || !supabase) {
@@ -36,6 +57,22 @@ export default function Driver() {
         console.log("[CampusRide Driver Realtime Channel Status]:", status);
         setIsConnected(status === "SUBSCRIBED");
       });
+
+    // Realtime channel for live student waits
+    const waitsChannel = supabase
+      .channel("driver-waits-channel")
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "stop_waits",
+        },
+        () => {
+          reloadWaits();
+        }
+      )
+      .subscribe();
 
     // Fetch initial state
     supabase
@@ -53,8 +90,11 @@ export default function Driver() {
         }
       });
 
+    reloadWaits();
+
     return () => {
       supabase?.removeChannel(channel);
+      supabase?.removeChannel(waitsChannel);
     };
   }, []);
 
@@ -113,14 +153,11 @@ export default function Driver() {
 
     // If Simulate Trip Mode is active
     if (isSimulateMode) {
-      // Broadcast initial point
       const initialPos = lerpOnRoute(simProgressRef.current);
       pushLocation(initialPos.lat, initialPos.lng, 5);
 
-      // Interval every 3 seconds to push simulated coordinates along route
       if (simIntervalRef.current) clearInterval(simIntervalRef.current);
       simIntervalRef.current = window.setInterval(() => {
-        // Advance loop by ~2.5% every 3 seconds (120s total loop)
         simProgressRef.current = (simProgressRef.current + 3 / 120) % 1;
         const nextPos = lerpOnRoute(simProgressRef.current);
         pushLocation(nextPos.lat, nextPos.lng, 5);
@@ -142,7 +179,6 @@ export default function Driver() {
       return;
     }
 
-    // Watch position
     watchIdRef.current = navigator.geolocation.watchPosition(
       (pos) => {
         pushLocation(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy);
@@ -186,6 +222,8 @@ export default function Driver() {
       if (simIntervalRef.current !== null) clearInterval(simIntervalRef.current);
     };
   }, []);
+
+  const totalWaiting = activeWaits.length;
 
   return (
     <div className="flex-1 flex flex-col items-center p-4 sm:p-6 max-w-lg mx-auto w-full space-y-4">
@@ -388,6 +426,48 @@ export default function Driver() {
             <span>Bus Full</span>
             <span className="text-[10px] font-normal opacity-90">No Entry</span>
           </button>
+        </div>
+      </div>
+
+      {/* Live Demand Card: Students Waiting Along Route */}
+      <div className="w-full bg-gray-900/90 border border-gray-800 rounded-2xl p-4 sm:p-5 shadow-lg space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <svg className="w-4 h-4 text-indigo-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" />
+              <circle cx="9" cy="7" r="4" />
+              <path d="M23 21v-2a4 4 0 00-3-3.87" />
+              <path d="M16 3.13a4 4 0 010 7.75" />
+            </svg>
+            <span className="text-xs font-semibold text-gray-300 uppercase tracking-wider">
+              Students Waiting
+            </span>
+          </div>
+          <span className="text-xs font-bold text-indigo-400 bg-indigo-950/80 border border-indigo-800/60 px-2 py-0.5 rounded-full">
+            {totalWaiting} total
+          </span>
+        </div>
+
+        <div className="divide-y divide-gray-800/80 text-xs">
+          {STOPS.map((stop, idx) => {
+            const count = activeWaits.filter((w) => w.stop_name === stop.name).length;
+            return (
+              <div key={stop.id} className="py-2.5 flex items-center justify-between">
+                <span className="text-gray-300 font-medium">
+                  {idx + 1}. {stop.name}
+                </span>
+                <span
+                  className={`px-2.5 py-0.5 rounded-full font-bold text-xs ${
+                    count > 0
+                      ? "bg-indigo-600 text-white shadow-sm"
+                      : "text-gray-500 bg-gray-800/60"
+                  }`}
+                >
+                  {count} waiting
+                </span>
+              </div>
+            );
+          })}
         </div>
       </div>
 
