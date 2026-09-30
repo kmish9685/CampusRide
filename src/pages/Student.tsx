@@ -41,8 +41,8 @@ const createStopIcon = (index: number, isSelected: boolean) => {
   });
 };
 
-// Modern SVG-based DivIcon for the bus with pulsing halo
-const createBusIcon = () => {
+// Modern SVG-based DivIcon for the bus with heading rotation & pulsing halo
+const createBusIcon = (bearing = 0) => {
   return L.divIcon({
     className: "custom-bus-marker",
     html: `
@@ -50,23 +50,22 @@ const createBusIcon = () => {
         display: flex;
         align-items: center;
         justify-content: center;
-        width: 36px;
-        height: 36px;
+        width: 38px;
+        height: 38px;
         background: #4f46e5;
         border: 2.5px solid #ffffff;
         border-radius: 9999px;
         box-shadow: 0 8px 16px rgba(79, 70, 229, 0.6);
+        transform: rotate(${Math.round(bearing)}deg);
+        transition: transform 0.35s ease-out;
       ">
-        <svg style="width: 20px; height: 20px; color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-          <rect x="3" y="4" width="18" height="13" rx="2" />
-          <path d="M16 17v2a1 1 0 01-1 1H9a1 1 0 01-1-1v-2" />
-          <circle cx="7.5" cy="13.5" r="1.5" fill="currentColor" />
-          <circle cx="16.5" cy="13.5" r="1.5" fill="currentColor" />
+        <svg style="width: 18px; height: 18px; fill: #ffffff;" viewBox="0 0 24 24">
+          <path d="M12 2L4.5 20.29l.71.71L12 18l6.79 3 .71-.71z" />
         </svg>
       </div>
     `,
-    iconSize: [36, 36],
-    iconAnchor: [18, 18],
+    iconSize: [38, 38],
+    iconAnchor: [19, 19],
   });
 };
 
@@ -487,7 +486,7 @@ export default function Student() {
           ))}
 
           {/* Bus Marker */}
-          <Marker position={[busPosition.lat, busPosition.lng]} icon={createBusIcon()}>
+          <Marker position={[busPosition.lat, busPosition.lng]} icon={createBusIcon(busPosition.bearing || 0)}>
             <Popup>
               <div className="text-gray-100 p-1">
                 <div className="font-bold text-sm text-indigo-400">{BUS_ID} (Campus Express)</div>

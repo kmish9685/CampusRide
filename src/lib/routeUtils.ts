@@ -1,7 +1,7 @@
 import { ROUTE_POLYLINE, STOPS, type RoutePoint } from "../data/route";
 
 /**
- * Calculate the total length of the polyline in km using Haversine formula.
+ * Calculate distance between two points in km using Haversine formula.
  */
 export function haversine(a: RoutePoint, b: RoutePoint): number {
   const R = 6371;
@@ -13,6 +13,22 @@ export function haversine(a: RoutePoint, b: RoutePoint): number {
       Math.cos((b.lat * Math.PI) / 180) *
       Math.sin(dLng / 2) ** 2;
   return R * 2 * Math.asin(Math.sqrt(sin2));
+}
+
+/**
+ * Calculates bearing angle in degrees [0, 360) from point a to point b.
+ */
+export function calculateBearing(a: RoutePoint, b: RoutePoint): number {
+  const lat1 = (a.lat * Math.PI) / 180;
+  const lat2 = (b.lat * Math.PI) / 180;
+  const dLng = ((b.lng - a.lng) * Math.PI) / 180;
+
+  const y = Math.sin(dLng) * Math.cos(lat2);
+  const x =
+    Math.cos(lat1) * Math.sin(lat2) -
+    Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+  const brng = (Math.atan2(y, x) * 180) / Math.PI;
+  return (brng + 360) % 360;
 }
 
 // Cumulative distances along the polyline
@@ -27,30 +43,34 @@ for (let i = 0; i < ROUTE_POLYLINE.length - 1; i++) {
 export const ROUTE_TOTAL_KM = totalLength;
 
 /**
- * Given a progress fraction [0,1], return the interpolated lat/lng on the polyline.
+ * Given a progress fraction [0,1], return the interpolated lat/lng and heading bearing along the road polyline.
  */
 export function lerpOnRoute(progress: number): RoutePoint {
-  const target = Math.min(progress, 1) * totalLength;
+  const target = Math.min(Math.max(progress, 0), 1) * totalLength;
   let accumulated = 0;
   for (let i = 0; i < segLengths.length; i++) {
     const seg = segLengths[i];
     if (accumulated + seg >= target) {
-      const t = (target - accumulated) / seg;
+      const t = seg > 0 ? (target - accumulated) / seg : 0;
       const a = ROUTE_POLYLINE[i];
       const b = ROUTE_POLYLINE[i + 1];
+      const bearing = calculateBearing(a, b);
       return {
         lat: a.lat + (b.lat - a.lat) * t,
         lng: a.lng + (b.lng - a.lng) * t,
+        bearing,
       };
     }
     accumulated += seg;
   }
-  return ROUTE_POLYLINE[ROUTE_POLYLINE.length - 1];
+  const last = ROUTE_POLYLINE[ROUTE_POLYLINE.length - 1];
+  const prev = ROUTE_POLYLINE[ROUTE_POLYLINE.length - 2] || last;
+  return { ...last, bearing: calculateBearing(prev, last) };
 }
 
 /**
  * Find the distance (km) from a point on the route (by progress) to a given stop.
- * Returns the remaining distance the bus still has to travel.
+ * Returns the remaining road distance the bus still has to travel.
  */
 export function distanceToStop(busProgress: number, stopId: string): number {
   const stop = STOPS.find((s) => s.id === stopId);
