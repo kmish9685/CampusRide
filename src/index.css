@@ -24,9 +24,6 @@ body {
   font-family: inherit;
 }
 
-.leaflet-tile-pane {
-  filter: brightness(0.7) invert(1) contrast(3) hue-rotate(200deg) saturate(0.3) brightness(0.7);
-}
 
 .leaflet-bar a {
   background-color: #1f2937 !important;

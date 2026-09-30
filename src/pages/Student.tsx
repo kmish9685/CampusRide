@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from "react";
 import { MapContainer, TileLayer, Polyline, Marker, Popup, useMap, ZoomControl } from "react-leaflet";
 import L from "leaflet";
 import { STOPS, ROUTE_POLYLINE, MAP_CENTER, MAP_ZOOM, type RoutePoint } from "../data/route";
-import { lerpOnRoute, distanceToStop, etaMinutes } from "../lib/routeUtils";
+import { lerpOnRoute, distanceToStop, etaMinutes, haversine, getRouteSegments } from "../lib/routeUtils";
 import { supabase, isSupabaseConfigured, type CrowdLevel, type BusRow } from "../lib/supabase";
 
 // Modern SVG-based DivIcons for stops
@@ -61,15 +61,28 @@ const createBusIcon = () => {
   });
 };
 
-// Lifecycle manager for map: invalidates size on mount & resize, handles pan
-function MapLifecycle({ center }: { center: RoutePoint }) {
+// Lifecycle manager for map: initial fitBounds with bottom padding, invalidateSize on mount & resize
+function MapLifecycle() {
   const map = useMap();
+  const hasFitBoundsRef = useRef(false);
 
   useEffect(() => {
+    // Initial size calculation
     map.invalidateSize();
     const timer = setTimeout(() => {
       map.invalidateSize();
     }, 250);
+
+    // Initial fitBounds with extra bottom padding for the bottom sheet card
+    if (!hasFitBoundsRef.current) {
+      const bounds = L.latLngBounds(ROUTE_POLYLINE.map((p) => [p.lat, p.lng]));
+      map.fitBounds(bounds, {
+        paddingTopLeft: [30, 30],
+        paddingBottomRight: [30, 260],
+        animate: false,
+      });
+      hasFitBoundsRef.current = true;
+    }
 
     const handleResize = () => {
       map.invalidateSize();
@@ -85,11 +98,38 @@ function MapLifecycle({ center }: { center: RoutePoint }) {
     };
   }, [map]);
 
-  useEffect(() => {
-    map.panTo([center.lat, center.lng], { animate: true, duration: 0.8 });
-  }, [center, map]);
-
   return null;
+}
+
+// Recenter on bus round floating button at top right
+function RecenterButton({ busPosition }: { busPosition: RoutePoint }) {
+  const map = useMap();
+
+  const handleRecenter = () => {
+    map.panTo([busPosition.lat, busPosition.lng], {
+      animate: true,
+      duration: 0.6,
+    });
+  };
+
+  return (
+    <div
+      className="leaflet-top leaflet-right"
+      style={{ marginTop: "72px", marginRight: "10px", pointerEvents: "auto", zIndex: 999 }}
+    >
+      <button
+        type="button"
+        onClick={handleRecenter}
+        className="w-10 h-10 rounded-full bg-gray-900/90 border border-gray-700 text-indigo-400 hover:text-white hover:bg-gray-800 shadow-xl flex items-center justify-center active:scale-90 transition-all backdrop-blur-md"
+        title="Recenter on bus"
+        aria-label="Recenter on bus"
+      >
+        <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <polygon points="3 11 22 2 13 21 11 13 3 11" />
+        </svg>
+      </button>
+    </div>
+  );
 }
 
 export default function Student() {
@@ -99,6 +139,15 @@ export default function Student() {
   const [crowdLevel, setCrowdLevel] = useState<CrowdLevel>("seats");
   const [lastUpdatedAt, setLastUpdatedAt] = useState<number>(Date.now());
   const [secondsAgo, setSecondsAgo] = useState<number>(0);
+  const [useOsmFallback, setUseOsmFallback] = useState<boolean>(false);
+  const tileErrorsRef = useRef<number>(0);
+
+  const handleTileError = () => {
+    tileErrorsRef.current += 1;
+    if (tileErrorsRef.current > 3 && !useOsmFallback) {
+      setUseOsmFallback(true);
+    }
+  };
 
   // Demo loop animation: 120 seconds full loop
   const demoProgressRef = useRef<number>(0);
@@ -203,11 +252,16 @@ export default function Student() {
 
   // ETA and distance calculations
   const selectedStop = STOPS.find((s) => s.id === selectedStopId) || STOPS[4];
-  const remainingKm = distanceToStop(
-    isDemoMode ? demoProgressRef.current : 0.3,
-    selectedStopId
-  );
+  const remainingKm = isDemoMode
+    ? distanceToStop(demoProgressRef.current, selectedStopId)
+    : haversine(busPosition, selectedStop);
   const etaMins = Math.max(1, Math.round(etaMinutes(remainingKm)));
+
+  // Calculate covered vs remaining segments along the route
+  const routeSegments = getRouteSegments(
+    isDemoMode ? demoProgressRef.current : 0.25,
+    busPosition
+  );
 
   // Crowd status styles
   const crowdStyles: Record<CrowdLevel, { bg: string; text: string; label: string; border: string }> = {
@@ -235,36 +289,79 @@ export default function Student() {
   const isWeakNetwork = secondsAgo > 30;
 
   return (
-    <div className="relative w-full h-[calc(100dvh-56px)] overflow-hidden bg-gray-950">
-      {/* Full Map Canvas */}
-      <div className="absolute inset-0 z-0">
+    <div className="relative w-full h-[calc(100dvh-56px)] overflow-hidden bg-gray-950" style={{ height: "calc(100dvh - 56px)" }}>
+      {/* Full Map Canvas with explicit height */}
+      <div className="absolute inset-0 z-0 w-full h-full" style={{ height: "100%", width: "100%" }}>
         <MapContainer
           center={[MAP_CENTER.lat, MAP_CENTER.lng]}
           zoom={MAP_ZOOM}
+          maxZoom={16}
           zoomControl={false}
           className="w-full h-full"
+          style={{ height: "100%", width: "100%" }}
         >
-          {/* Zoom controls moved to top-right so they are never blocked by bottom sheet */}
+          {/* Zoom controls at top right */}
           <ZoomControl position="topright" />
 
-          <TileLayer
-            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-          />
+          {/* Esri Dark Canvas with OpenStreetMap automatic fallback */}
+          {!useOsmFallback ? (
+            <>
+              {/* Esri Dark Gray Base */}
+              <TileLayer
+                attribution="Tiles &copy; Esri"
+                url="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}"
+                maxZoom={16}
+                eventHandlers={{
+                  tileerror: handleTileError,
+                }}
+              />
+              {/* Esri Dark Gray Reference Labels on top */}
+              <TileLayer
+                attribution="Tiles &copy; Esri"
+                url="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}"
+                maxZoom={16}
+                pane="overlayPane"
+              />
+            </>
+          ) : (
+            /* Automatic fallback to standard OpenStreetMap */
+            <TileLayer
+              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+              url="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+              maxZoom={19}
+            />
+          )}
 
-          <MapLifecycle center={busPosition} />
+          <MapLifecycle />
+          <RecenterButton busPosition={busPosition} />
 
-          {/* Bus Route Polyline */}
-          <Polyline
-            positions={ROUTE_POLYLINE.map((p) => [p.lat, p.lng])}
-            pathOptions={{
-              color: "#6366f1",
-              weight: 5,
-              opacity: 0.9,
-              lineCap: "round",
-              lineJoin: "round",
-            }}
-          />
+          {/* Covered Route Segment (Faded Grey) */}
+          {routeSegments.covered.length > 1 && (
+            <Polyline
+              positions={routeSegments.covered.map((p) => [p.lat, p.lng])}
+              pathOptions={{
+                color: "#4b5563",
+                weight: 6,
+                opacity: 0.5,
+                lineCap: "round",
+                lineJoin: "round",
+              }}
+            />
+          )}
+
+          {/* Remaining Route Segment (Accent Indigo) */}
+          {routeSegments.remaining.length > 1 && (
+            <Polyline
+              positions={routeSegments.remaining.map((p) => [p.lat, p.lng])}
+              pathOptions={{
+                color: "#6366f1",
+                weight: 6,
+                opacity: 0.95,
+                lineCap: "round",
+                lineJoin: "round",
+              }}
+            />
+          )}
 
           {/* Stops Markers */}
           {STOPS.map((stop, idx) => (
@@ -355,12 +452,19 @@ export default function Student() {
               </button>
               <button
                 type="button"
-                onClick={() => setIsDemoMode(false)}
+                onClick={() => {
+                  if (!isSupabaseConfigured) {
+                    alert("Supabase is not configured yet. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env to enable Live GPS mode.");
+                    return;
+                  }
+                  setIsDemoMode(false);
+                }}
                 className={`h-full px-2.5 sm:px-3 rounded-lg text-xs font-semibold transition-all ${
                   !isDemoMode
                     ? "bg-indigo-600 text-white shadow-sm"
                     : "text-gray-400 hover:text-gray-200"
                 }`}
+                title={!isSupabaseConfigured ? "Connect Supabase to enable Live Mode" : "Switch to Live GPS"}
               >
                 Live
               </button>

@@ -3,7 +3,7 @@ import { ROUTE_POLYLINE, STOPS, type RoutePoint } from "../data/route";
 /**
  * Calculate the total length of the polyline in km using Haversine formula.
  */
-function haversine(a: RoutePoint, b: RoutePoint): number {
+export function haversine(a: RoutePoint, b: RoutePoint): number {
   const R = 6371;
   const dLat = ((b.lat - a.lat) * Math.PI) / 180;
   const dLng = ((b.lng - a.lng) * Math.PI) / 180;
@@ -80,4 +80,30 @@ export function distanceToStop(busProgress: number, stopId: string): number {
 export const DEMO_SPEED_KMH = 25;
 export function etaMinutes(remainingKm: number): number {
   return (remainingKm / DEMO_SPEED_KMH) * 60;
+}
+
+/**
+ * Splits ROUTE_POLYLINE into covered and remaining segments based on progress [0, 1] and busPos.
+ */
+export function getRouteSegments(progress: number, busPos: RoutePoint): {
+  covered: RoutePoint[];
+  remaining: RoutePoint[];
+} {
+  const target = Math.min(Math.max(progress, 0), 1) * totalLength;
+  let accumulated = 0;
+  let splitIndex = 0;
+
+  for (let i = 0; i < segLengths.length; i++) {
+    const seg = segLengths[i];
+    if (accumulated + seg >= target) {
+      splitIndex = i;
+      break;
+    }
+    accumulated += seg;
+  }
+
+  const covered: RoutePoint[] = [...ROUTE_POLYLINE.slice(0, splitIndex + 1), busPos];
+  const remaining: RoutePoint[] = [busPos, ...ROUTE_POLYLINE.slice(splitIndex + 1)];
+
+  return { covered, remaining };
 }
