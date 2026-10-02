@@ -52,7 +52,7 @@ Create the database tables by running `supabase/schema.sql` in the Supabase SQL 
 
 ## Note
 
-This was built in a 2-day hackathon. Database write access is open to make the demo easy to run. Before real use, driver and admin accounts should require login.
+This was built during a hackathon. Database write access is open to make the demo easy to run. Before real use, driver and admin accounts should require login.
 
 ## Team
 
